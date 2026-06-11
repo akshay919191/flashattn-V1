@@ -1,0 +1,17 @@
+
+# Aider AI files
+.aider*
+
+# Profiling reports (Nsight Compute / Systems)
+*.ncu-rep
+*.nsys-rep
+
+# Python cache & compiled files (from running benchmarks)
+__pycache__/
+*.pyc
+
+# Build outputs (if you compile binaries or libraries)
+build/
+bin/
+*.out
+*.o
