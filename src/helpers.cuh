@@ -2,6 +2,7 @@
 #define MMA_HELPERS_CUH
 
 #include <cuda_fp16.h>
+#include <stdint.h>
 
 #define WARP_FULL_MASK 0xffffffff
 
@@ -13,10 +14,11 @@ __device__ __forceinline__ void m16n8k16(
     const __half* smem_b,
     const int lane,
     const int group,
-    int stride_a,
-    int stride_b
+    int Br,
+    int whichrow , int whichcol , int maincol/// this tells which we need from Br * Br
 )
 {
+
     int c0 = (lane % 4) * 2;
     int c1 = c0 + 8;
 
@@ -28,15 +30,14 @@ __device__ __forceinline__ void m16n8k16(
     uint32_t b_frag[2];
 
     /// uint32_t fragments to store floats in fragment for mma
-        
-    a_frag[0] = *reinterpret_cast<const uint32_t*>(&smem_a[ group      * 16 + c0]);    
-    a_frag[1] = *reinterpret_cast<const uint32_t*>(&smem_a[(group + 8) * 16 + c0]);    
-    a_frag[2] = *reinterpret_cast<const uint32_t*>(&smem_a[ group      * 16 + c1]);    
-    a_frag[3] = *reinterpret_cast<const uint32_t*>(&smem_a[(group + 8) * 16 + c1]);        
+    a_frag[0] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * Br + whichcol * 16 +  group      * Br + c0]);
+    a_frag[1] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * Br + whichcol * 16 + (group + 8) * Br + c0]);
+    a_frag[2] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * Br + whichcol * 16 +  group      * Br + c1]);
+    a_frag[3] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * Br + whichcol * 16 + (group + 8) * Br + c1]);
 
-    b_frag[0] = (uint32_t(__half_as_ushort(smem_b[r0 * 8 + group])) | uint32_t(__half_as_ushort(smem_b[(r0 + 1) * 8 + group])) << 16);
-    b_frag[1] = (uint32_t(__half_as_ushort(smem_b[r1 * 8 + group])) | uint32_t(__half_as_ushort(smem_b[(r1 + 1) * 8 + group])) << 16);
-
+    b_frag[0] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * Br + maincol * 8 + r0 * Br + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * Br + maincol * 8 + (r0 + 1) * Br + group])));
+    b_frag[1] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * Br + maincol * 8 + r1 * Br + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * Br + maincol * 8 + (r1 + 1) * Br + group])));
+    
     __syncthreads();
 
     asm volatile(
@@ -49,7 +50,7 @@ __device__ __forceinline__ void m16n8k16(
         : "r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]) , 
           "r"(b_frag[0]) , "r"(b_frag[1]),
           "f"(d1) , "f"(d2) , "f"(d3) , "f"(d4)
-    )
+    );
 }
 
 
@@ -120,3 +121,6 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     }
     return val; 
 }
+
+
+#endif // MMA_HELPERS_CUH
