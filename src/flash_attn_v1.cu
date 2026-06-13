@@ -13,7 +13,7 @@
 #include <iostream>
 
 /// for building it up
-#include <torch/extension.h>
+// #include <torch/extension.h>
 
 /// to include our prebuilt function from other file
 #include "helpers.cuh"
@@ -47,7 +47,7 @@ __global__ void flashattn_fwd_kernel(
     const int tid = threadIdx.x;
 
     /// warpping here , 32 threads makes one warp
-    const int warpid = tid / 32;
+    const int warp = tid / 32;
 
     /// lane for always in under 32
     const int lane = tid % 32;
@@ -143,45 +143,216 @@ __global__ void flashattn_fwd_kernel(
     /// calculations we have Br * HEADDIM elements and 2 bytes each
     /// formula is (total elements) * size_of(data_type) / total_threads * 4
 
-    const int Q_ELEMENTS_PER_THREAD = (Br * HEAD_DIM) / blockDim.x;
-    const int Q_REGISTERS_PER_THREAD = (Q_ELEMENTS_PER_THREAD * sizeof(__half)) / 4; 
-
-    uint32_t q_reg[Q_REGISTERS_PER_THREAD];
+    constexpr int Q_REGS = ((Br * HEAD_DIM) / 128) / 2; /// 128 are number of threads
+    uint32_t q_reg[Q_REGS];
     
     /// now we will load __half2 elements because each threads load , so we are using uint32_t as global standard so 32 bit , means 2 half element 
     __half2* global_q_half2 = reinterpret_cast<__half2*>(const_cast<__half*>(Qptr) + (Qrowitr * Br * HEAD_DIM));
 
     /// total half2 elements
     const int total_half2 = Br * HEAD_DIM / 2;
+    const int q_row_base = warp * 16;
+
+
+    const int Tk = HEAD_DIM / 16;
+    const int Tn = Br / 8;
+    const int SMEM_STRIDE = HEAD_DIM + 8;
 
     /// we will use pragma unroll so it can happen wihout waiting
     /// so each threads have Q_REGISTERS_PER_THREAD this much registers and each warp first takes total threads * 2 element in rg[0] and then next in reg[1] so this way threads are collesced not registers
     #pragma unroll
-    for(int regIDX = 0 ; regIDX < Q_REGISTERS_PER_THREAD ; regIDX++)
-    {
-        int global_idx = (regIDX * blockDim.x) + tid;
+    for (int k = 0; k < Tk; k++) {
+        int row0 = q_row_base + (lane / 4) + Qrowitr * Br;      
+        int row1 = row0 + 8;                     
+        int col0 = k * 16 + (lane % 4) * 2;      
+        int col1 = col0 + 8;                     
 
-        if(global_idx < total_half2) {
-            q_reg[regIDX] = *reinterpret_cast<uint32_t*>(&global_q_half2[global_idx]);
-        }
-        else {
-            q_reg[regIDX] = 0; 
-        }
+        int base = k * 4;
+        q_reg[base+0] = *reinterpret_cast<const uint32_t*>(&Qptr[row0 * HEAD_DIM + col0]);
+        q_reg[base+1] = *reinterpret_cast<const uint32_t*>(&Qptr[row1 * HEAD_DIM + col0]);
+        q_reg[base+2] = *reinterpret_cast<const uint32_t*>(&Qptr[row0 * HEAD_DIM + col1]);
+        q_reg[base+3] = *reinterpret_cast<const uint32_t*>(&Qptr[row1 * HEAD_DIM + col1]);
     }
-
     __syncthreads();
 
     /// now we have Q in our register 
-    /// thing to be considered Q has a shape of SEQLEN * HEAD_DIMso anyway i am covering whole cols of each row , so i can preload it once instead doing it in a loop
-    
+    /// thing to be considered Q has a shape of SEQLEN * HEAD_DIMso anyway i am covering whole cols of each row
+
     /// this tells the number of row iteration in K.T
+    /// V shape is HEAD_DIM * BR
     const int totalrow = (SEQLEN + HEAD_DIM - 1) / HEAD_DIM; 
 
     /// this tells the total col iteration that could happen inside a row of K.T
-    const int totalcol = (HEAD_DIM + Br - 1) / Br;
+    const int numtiles = (HEAD_DIM + Br - 1) / Br;
 
+    /// now we will use float4 to load so i need to find number of float4 in V one block 
+    /// size if HEAD_DIM * BR
+    const int float4s_per_tile = (HEAD_DIM * Br) / 8;
+    const int Matrix_row       = SEQLEN;
+    const int Matrix_col       = HEAD_DIM;
 
+    /// loading slot 0
+    uint32_t smenptr0 = __cvta_generic_to_shared(k_stages[0]);
+    asyncLOAD<HEAD_DIM, Br, 128>(
+        Kptr,
+        smenptr0,
+        tid,
+        HEAD_DIM,
+        (HEAD_DIM + PADDED_STRIDE),
+        float4s_per_tile,
+        Matrix_row , Matrix_col,
+        0 , 0
+        );
     
+    /// loading slot 1
+    /// do a safety check if we have more slots to load or not
+    uint32_t smenptr1 = __cvta_generic_to_shared(k_stages[1]);
+    asyncLOAD<HEAD_DIM, Br, 128>(
+        Kptr,
+        smenptr1,
+        tid,
+        HEAD_DIM,
+        (HEAD_DIM + PADDED_STRIDE),
+        float4s_per_tile,
+        Matrix_row , Matrix_col,
+        0 , 1
+        );
 
+    uint32_t ptr0 = __cvta_generic_to_shared(v_stages[0]);
+    asyncLOAD<HEAD_DIM, Br, 128>(
+        Vptr,
+        ptr0,
+        tid,
+        HEAD_DIM,
+        (HEAD_DIM + PADDED_STRIDE),
+        float4s_per_tile,
+        Matrix_row , Matrix_col,
+        0 , 0
+        );
+    
+    /// loading slot 1
+    /// do a safety check if we have more slots to load or not
+    uint32_t ptr1 = __cvta_generic_to_shared(v_stages[1]);
+    asyncLOAD<HEAD_DIM, Br, 128>(
+        Vptr,
+        ptr1,
+        tid,
+        HEAD_DIM,
+        (HEAD_DIM + PADDED_STRIDE),
+        float4s_per_tile,
+        Matrix_row , Matrix_col,
+        0 , 1
+        );
+    
+    /// commit all the into pipeline
+    asm volatile("cp.async.commit_group;\n");
+
+    /// wait for all streams to be finished
+    asm volatile("cp.async.wait_all;\n");
+
+    /// no need ig because of wait but still a safe fallback
+    __syncthreads();
+
+
+    for(int rowid = 0 ; rowid < totalrow ; rowid++)
+    {
+        /// now we iterating over rows
+        /// now we will iterate over cols in ech row
+        for(int tile = 0 ; tile < numtiles ; tile++)
+        {
+            /// now the real thing we need triple load here 
+            /// 2 loaded already 
+
+            int cur  = (tile % STAGES); /// cur means current slot in shared mem not actual tile id
+            int next = (tile + 2);
+            int pre  = (tile + 2) % STAGES; /// which we need to load now
+
+            if(next < numtiles)
+            {
+                uint32_t smenptr = __cvta_generic_to_shared(k_stages[pre]);
+                asyncLOAD<HEAD_DIM, Br, 128>(
+                    Kptr,
+                    smenptr,
+                    tid,
+                    HEAD_DIM,
+                    (HEAD_DIM + PADDED_STRIDE),
+                    float4s_per_tile,
+                    Matrix_row , Matrix_col,
+                    rowid , next
+                    );
+
+                /// we gonna commit to our pipeline
+                asm volatile("cp.async.commit_group;\n");
+            }
+
+            /// now we have to wait for each stream line to complete
+            if (tile < numtiles - 2) {
+                asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+            } 
+            else if (tile == numtiles - 2) {
+                asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            } 
+            else {
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            }
+
+            /// we are syncing for a safety fallback
+            __syncthreads();
+
+            /// now we have loaded all at fast speed 
+
+            /// now we have slots we need mma PTX assembly mma.sync to multiply matrix 
+            /// we have function for that too , now we need to maop the maths because our function is for m16n8k16 and our actual shapes are HEAD_DIM * Br
+
+            /// as our shaped are large than required we will use looping
+            /// here is some indexing for looping over each slot for inline asm PTX
+
+            /// reason i am not using variable si to get saved from register spilling
+
+            /// reason behind hardcoding to 16 is mma.sync works on 16*8*16 here and usign Br is essential for Q
+            // const int Tr = Br / 16;
+
+            /// its for col iteration in a row of Query and row iter fro a single col for Key.Transpose
+            // const int Tc = HEAD_DIM / 16;
+
+            /// this is for ech col iteration in a row of key.Transpose 
+            // const int cc = Br / 8;
+
+            float acc[4][4] = {{0.f}};
+
+            #pragma unroll
+            for (int nc = 0; nc < Tn; nc++) {
+                #pragma unroll
+                for (int kc = 0; kc < Tk; kc++) {
+                    m16n8k16_reg(
+                        acc[nc][0], acc[nc][1], acc[nc][2], acc[nc][3],
+                        &q_reg[kc * 4],
+                        k_stages[cur],
+                        lane, group,
+                        SMEM_STRIDE,
+                        kc,
+                        nc
+                    );
+                }
+            }
+
+            {
+            int row0 = Qrowitr * Br + q_row_base + (lane / 4);
+            int row1 = row0 + 8;
+            #pragma unroll
+            for (int nc = 0; nc < Tn; nc++) 
+                {
+                int col0 = nc * 8 + (lane % 4) * 2;
+                int col1 = col0 + 1;
+
+                out[row0 * Br + col0] = acc[nc][0];
+                out[row0 * Br + col1] = acc[nc][1];
+                out[row1 * Br + col0] = acc[nc][2];
+                out[row1 * Br + col1] = acc[nc][3];
+                }
+            }
+        }
+        /// here 
+    }
 }   
 
