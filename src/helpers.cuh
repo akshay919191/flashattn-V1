@@ -14,7 +14,8 @@ __device__ __forceinline__ void m16n8k16(
     const __half* smem_b,
     const int lane,
     const int group,
-    int stride,
+    int strideA,
+    int strideB,
     int whichrow , int whichcol , int maincol/// this tells which we need from Br * Br
 )
 {
@@ -30,13 +31,13 @@ __device__ __forceinline__ void m16n8k16(
     uint32_t b_frag[2];
 
     /// uint32_t fragments to store floats in fragment for mma
-    a_frag[0] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * stride + whichcol * 16 +  group      * stride + c0]);
-    a_frag[1] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * stride + whichcol * 16 + (group + 8) * stride + c0]);
-    a_frag[2] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * stride + whichcol * 16 +  group      * stride + c1]);
-    a_frag[3] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * stride + whichcol * 16 + (group + 8) * stride + c1]);
+    a_frag[0] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * strideA + whichcol * 16 +  group      * strideA + c0]);
+    a_frag[1] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * strideA + whichcol * 16 + (group + 8) * strideA + c0]);
+    a_frag[2] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * strideA + whichcol * 16 +  group      * strideA + c1]);
+    a_frag[3] = *reinterpret_cast<const uint32_t*>(&smem_a[whichrow * 16 * strideA + whichcol * 16 + (group + 8) * strideA + c1]);
 
-    b_frag[0] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * stride + maincol * 8 + r0 * stride + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * stride + maincol * 8 + (r0 + 1) * stride + group])) << 16);
-    b_frag[1] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * stride + maincol * 8 + r1 * stride + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * stride + maincol * 8 + (r1 + 1) * stride + group])) << 16);
+    b_frag[0] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * strideB + maincol * 8 + r0 * strideB + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * strideB + maincol * 8 + (r0 + 1) * strideB + group])) << 16);
+    b_frag[1] = (uint32_t(__half_as_ushort(smem_b[whichcol * 16 * strideB + maincol * 8 + r1 * strideB + group])) | uint32_t(__half_as_ushort(smem_b[whichcol * 16 * strideB + maincol * 8 + (r1 + 1) * strideB + group])) << 16);
     
     __syncthreads();
 
@@ -51,6 +52,62 @@ __device__ __forceinline__ void m16n8k16(
           "r"(b_frag[0]) , "r"(b_frag[1]),
           "f"(d1) , "f"(d2) , "f"(d3) , "f"(d4)
     );
+}
+
+template<int Br, int headdim>
+__device__ __forceinline__ void matmul_tile(const __half* __restrict__ A,
+                             const __half* __restrict__ B,
+                                   float*  __restrict__ C)
+{
+    extern __shared__ __half smem[];
+    __half* smem_a = smem;           
+    __half* smem_b = smem + 64 * Br; 
+    const int tid     = threadIdx.x;
+    const int warp = tid / 32;     
+    const int lane    = tid % 32;
+    const int group   = lane / 4;
+
+    const int block_m_base = blockIdx.x * 4; 
+
+    for (int i = tid; i < 64 * Br; i += blockDim.x)
+    {
+        int row = i / Br;
+        int col = i % Br;
+        smem_a[i] = A[(block_m_base * 16 + row) * Br + col];
+    }
+
+    for (int i = tid; i < Br * headdim; i += blockDim.x)
+        smem_b[i] = B[i];
+
+    __syncthreads();
+
+    constexpr int kTiles = Br / 16;
+    constexpr int nTiles = headdim / 8;
+
+    __half* my_smem_a = smem_a + warp * 16 * Br;
+
+    for (int nt = 0; nt < nTiles; ++nt)
+    {
+        float d1 = 0.f, d2 = 0.f, d3 = 0.f, d4 = 0.f;
+
+        for (int kt = 0; kt < kTiles; ++kt)
+        {
+            m16n8k16(d1, d2, d3, d4,
+                     my_smem_a, smem_b,
+                     lane, group,
+                     /*strideA=*/Br, /*strideB=*/headdim,
+                     /*whichrow=*/0, /*whichcol=*/kt, /*maincol=*/nt);
+        }
+
+        int c0      = (lane % 4) * 2;
+        int rowbase = (block_m_base + warp) * 16;
+        int colbase = nt * 8;
+
+        C[(rowbase + group)     * headdim + colbase + c0]     = d1;
+        C[(rowbase + group)     * headdim + colbase + c0 + 1] = d2;
+        C[(rowbase + group + 8) * headdim + colbase + c0]     = d3;
+        C[(rowbase + group + 8) * headdim + colbase + c0 + 1] = d4;
+    }
 }
 
 __device__ __forceinline__ void m16n8k16_reg(
@@ -99,12 +156,12 @@ __device__ __forceinline__ void asyncLOAD(
     const __half* matA,
     uint32_t      smem_a,
     int           tid,
-    const int     stride_,           // Global matrix row width  (N_GLOBAL = 256)
-    const int     padstr_,           // Physical smem row width   (PADSTR  = 40)
+    const int     stride_,           // Global matrix row width  
+    const int     padstr_,           // Physical smem row width   
     const int     float4s_per_tile,  // Total 16-byte vectors to load
     const int     M, const int N,    // Global matrix boundary limits
-    const int     block_row_start,   // Tile row index  (0-based)
-    const int     block_col_start    // Tile col index  (0-based)
+    const int     block_row_start,   // Tile row index 
+    const int     block_col_start    // Tile col index  
 )
 {
     const int elements_per_vector = 8; // 16 bytes / sizeof(__half)
