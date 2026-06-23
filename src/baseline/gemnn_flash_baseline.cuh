@@ -2,7 +2,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <cuda_fp16.h>
+#include <cuda_fp16.h>  
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <math.h>
@@ -115,10 +115,6 @@ __global__ void flashattn_fwd_kernel(
         (reinterpret_cast<uintptr_t>(ptr) + 15) & ~15ULL
     );
 
-    __half* smem_a = reinterpret_cast<__half*>(ptr);
-    ptr += 4 * 16 * 16 * sizeof(__half);
-
-    __half* warp_smem_a = smem_a + warp * 16 * 16;
 
     float* s_mem = reinterpret_cast<float*>(ptr);
     float* o_acc = s_mem + Br * Br;
@@ -128,6 +124,9 @@ __global__ void flashattn_fwd_kernel(
     const float SCALE = 1.0f / sqrtf((float)HEAD_DIM);
     const int Qrowitr = tileitr;
     const int numtiles = (SEQLEN + Br - 1) / Br;
+
+    const int kv_tiles = min(numtiles, Qrowitr + 1);
+
 
     constexpr int Tk = HEAD_DIM / 16;
     constexpr int Q_REGS = 4 * Tk;
@@ -193,7 +192,6 @@ __global__ void flashattn_fwd_kernel(
 
     const int float4s_per_tile = (Br * HEAD_DIM) / 8;
 
-    // Preload only K0. Do NOT preload V anymore.
     uint32_t smenptr0 = __cvta_generic_to_shared(k_stages[0]);
     asyncLOAD<Br, HEAD_DIM, 128>(
         Kptr,
@@ -210,9 +208,8 @@ __global__ void flashattn_fwd_kernel(
 
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n");
-    __syncthreads();
 
-    for (int tile = 0; tile < numtiles; tile++)
+    for (int tile = 0; tile < kv_tiles; tile++)
     {
         int cur = tile % STAGES;
         int next = tile + 1;
@@ -220,7 +217,7 @@ __global__ void flashattn_fwd_kernel(
 
         // Prefetch next K only.
         // We do not wait for it here because current K is already ready.
-        if (next < numtiles) {
+        if (next < kv_tiles) {
             uint32_t smenptr = __cvta_generic_to_shared(k_stages[next_stage]);
 
             asyncLOAD<Br, HEAD_DIM, 128>(
@@ -238,8 +235,6 @@ __global__ void flashattn_fwd_kernel(
 
             asm volatile("cp.async.commit_group;\n");
         }
-
-        __syncthreads();
 
         constexpr int N_GROUPS = (Br + 7) / 8;
 
@@ -282,41 +277,55 @@ __global__ void flashattn_fwd_kernel(
                 float s10 = acc_s[2] * SCALE;
                 float s11 = acc_s[3] * SCALE;
 
-                if (local_row0 < Br && col0 < Br) {
+                bool row0_ok = (local_row0 < Br);
+                bool row1_ok = (local_row1 < Br);
+
+                bool col0_ok = (col0 < Br);
+                bool col1_ok = (col1 < Br);
+
+                bool row0_valid = (global_row0 < SEQLEN);
+                bool row1_valid = (global_row1 < SEQLEN);
+
+                bool col0_valid = (kv_col0 < SEQLEN);
+                bool col1_valid = (kv_col1 < SEQLEN);
+
+                bool diagonal_tile = (tile == Qrowitr);
+
+                if (row0_ok && col0_ok) {
                     bool mask00 =
-                        (kv_col0 > global_row0) ||
-                        (kv_col0 >= SEQLEN) ||
-                        (global_row0 >= SEQLEN);
+                        (!row0_valid) ||
+                        (!col0_valid) ||
+                        (diagonal_tile && kv_col0 > global_row0);
 
                     s_mem[local_row0 * Br + col0] =
                         mask00 ? -FLT_MAX : s00;
                 }
 
-                if (local_row0 < Br && col1 < Br) {
+                if (row0_ok && col1_ok) {
                     bool mask01 =
-                        (kv_col1 > global_row0) ||
-                        (kv_col1 >= SEQLEN) ||
-                        (global_row0 >= SEQLEN);
+                        (!row0_valid) ||
+                        (!col1_valid) ||
+                        (diagonal_tile && kv_col1 > global_row0);
 
                     s_mem[local_row0 * Br + col1] =
                         mask01 ? -FLT_MAX : s01;
                 }
 
-                if (local_row1 < Br && col0 < Br) {
+                if (row1_ok && col0_ok) {
                     bool mask10 =
-                        (kv_col0 > global_row1) ||
-                        (kv_col0 >= SEQLEN) ||
-                        (global_row1 >= SEQLEN);
+                        (!row1_valid) ||
+                        (!col0_valid) ||
+                        (diagonal_tile && kv_col0 > global_row1);
 
                     s_mem[local_row1 * Br + col0] =
                         mask10 ? -FLT_MAX : s10;
                 }
 
-                if (local_row1 < Br && col1 < Br) {
+                if (row1_ok && col1_ok) {
                     bool mask11 =
-                        (kv_col1 > global_row1) ||
-                        (kv_col1 >= SEQLEN) ||
-                        (global_row1 >= SEQLEN);
+                        (!row1_valid) ||
+                        (!col1_valid) ||
+                        (diagonal_tile && kv_col1 > global_row1);
 
                     s_mem[local_row1 * Br + col1] =
                         mask11 ? -FLT_MAX : s11;
@@ -325,6 +334,27 @@ __global__ void flashattn_fwd_kernel(
         }
 
         __syncthreads();
+
+        {
+            uint32_t v_smem = __cvta_generic_to_shared(v_stage);
+
+            asyncLOAD<Br, HEAD_DIM, 128>(
+                Vptr,
+                v_smem,
+                tid,
+                HEAD_DIM,
+                SMEM_STRIDE_KV,
+                float4s_per_tile,
+                SEQLEN,
+                HEAD_DIM,
+                tile,
+                0
+            );
+
+            asm volatile("cp.async.commit_group;\n");
+        }
+
+        __half* p_half = k_stages[cur];
 
         // Online softmax with unnormalized O accumulator.
         for (int row = warp; row < Br; row += 4) {
@@ -349,7 +379,7 @@ __global__ void flashattn_fwd_kernel(
             }
 
             float l_val = 0.f;
-
+            
             for (int c = lane; c < Br; c += 32) {
                 l_val += __expf(s_mem[row * Br + c] - m_val);
             }
@@ -378,44 +408,11 @@ __global__ void flashattn_fwd_kernel(
 
             for (int c = lane; c < Br; c += 32) {
                 float p = beta * __expf(s_mem[row * Br + c] - m_val);
-                s_mem[row * Br + c] = p;
+                p_half[row * Br + c] = __float2half(p);
             }
         }
 
-        __syncthreads();
-
-        // Reuse current K buffer as P half buffer.
-        // QK for this tile is already finished, so k_stages[cur] is free.
-        __half* p_half = k_stages[cur];
-
-        for (int i = tid; i < Br * Br; i += 128) {
-            p_half[i] = __float2half(s_mem[i]);
-        }
-
-        __syncthreads();
-
-        // Load CURRENT V tile into the single V buffer.
-        // This wait_group 0 also completes any pending K_next load.
-        {
-            uint32_t v_smem = __cvta_generic_to_shared(v_stage);
-
-            asyncLOAD<Br, HEAD_DIM, 128>(
-                Vptr,
-                v_smem,
-                tid,
-                HEAD_DIM,
-                SMEM_STRIDE_KV,
-                float4s_per_tile,
-                SEQLEN,
-                HEAD_DIM,
-                tile,
-                0
-            );
-
-            asm volatile("cp.async.commit_group;\n");
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-        }
-
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
         __syncthreads();
 
         // O += P @ V
@@ -444,43 +441,28 @@ __global__ void flashattn_fwd_kernel(
                 for (int k_tile = 0; k_tile < num_k_tiles_p; k_tile++) {
                     int k_start = k_tile * 16;
 
-                    for (int i = lane; i < 256; i += 32) {
-                        int r = i / 16;
-                        int c = i % 16;
-
-                        int gr = row_start + r;
-                        int gc = k_start + c;
-
-                        warp_smem_a[i] =
-                            (gr < Br && gc < Br)
-                            ? p_half[gr * Br + gc]
-                            : __float2half(0.f);
-                    }
-
-                    __syncwarp();
-
                     int c0 = (lane % 4) * 2;
 
                     uint32_t a_frag[4];
 
                     a_frag[0] =
                         *reinterpret_cast<const uint32_t*>(
-                            &warp_smem_a[group * 16 + c0]
+                            &p_half[(row_start + group) * Br + (k_start + c0)]
                         );
 
                     a_frag[1] =
                         *reinterpret_cast<const uint32_t*>(
-                            &warp_smem_a[(group + 8) * 16 + c0]
+                            &p_half[(row_start + group + 8) * Br + (k_start + c0)]
                         );
 
                     a_frag[2] =
                         *reinterpret_cast<const uint32_t*>(
-                            &warp_smem_a[group * 16 + c0 + 8]
+                            &p_half[(row_start + group) * Br + (k_start + c0 + 8)]
                         );
 
                     a_frag[3] =
                         *reinterpret_cast<const uint32_t*>(
-                            &warp_smem_a[(group + 8) * 16 + c0 + 8]
+                            &p_half[(row_start + group + 8) * Br + (k_start + c0 + 8)]
                         );
 
                     uint32_t b_frag[2];
@@ -526,8 +508,6 @@ __global__ void flashattn_fwd_kernel(
                           "r"(a_frag[2]), "r"(a_frag[3]),
                           "r"(b_frag[0]), "r"(b_frag[1])
                     );
-
-                    __syncwarp();
                 }
 
                 int row0 = group;
