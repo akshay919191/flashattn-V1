@@ -340,8 +340,8 @@ __global__ void flashattn_fwd_kernel(
             O_STRIDE
         );
     }
-    /// now we have the fucking acc for O
-    /// store it fucking globally 
+    /// now we have the acc for O
+    /// store it globally 
     for(int i = tid; i < Br * D; i += blockDim.x)
     {
         int r = i / D;
