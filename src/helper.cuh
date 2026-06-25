@@ -82,22 +82,6 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
     }
 }
 
-/// for softmax reduction
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_xor_sync(WARP_FULL_MASK, val, offset));
-    }
-    return val; 
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(WARP_FULL_MASK, val, offset);
-    }
-    return val; 
-}
 
 
 __device__ __forceinline__ void mma_score_strided(
@@ -218,6 +202,174 @@ __device__ __forceinline__ uint32_t pack_float2_to_half2_u32(float x, float y)
     return *reinterpret_cast<uint32_t*>(&h2);
 }
 
+template<int Br, int D>
+__device__ __forceinline__ void oaccSCALING(
+    float* Oacc,
+    const float* __restrict__ Alpha
+)
+{
+    int tid   = threadIdx.x;
+    int lane  = tid & 31;
+    int warp  = tid >> 5;
+    int group = lane >> 2;
+
+    constexpr int WARPS = 4;
+    constexpr int MMA_M = 16;
+    constexpr int MMA_N = 8;
+
+    constexpr int NUM_M_TILES = (Br + MMA_M - 1) / MMA_M;
+    constexpr int NUM_N_TILES = (D  + MMA_N - 1) / MMA_N;
+    constexpr int TOTAL_O_TILES = NUM_M_TILES * NUM_N_TILES;
+    constexpr int O_TILES_PER_WARP = (TOTAL_O_TILES + WARPS - 1) / WARPS;
+
+    #pragma unroll 1
+    for (int t = 0; t < O_TILES_PER_WARP; t++) {
+        int tile_idx = warp + t * WARPS;
+
+        if (tile_idx >= TOTAL_O_TILES) continue;
+
+        int mt = tile_idx / NUM_N_TILES;
+        int row_start = mt * MMA_M;
+
+        int r0 = row_start + group;
+        int r1 = row_start + group + 8;
+
+        float alpha0 = (r0 < Br) ? Alpha[r0] : 0.0f;
+        float alpha1 = (r1 < Br) ? Alpha[r1] : 0.0f;
+
+        Oacc[t * 4 + 0] *= alpha0;
+        Oacc[t * 4 + 1] *= alpha0;
+        Oacc[t * 4 + 2] *= alpha1;
+        Oacc[t * 4 + 3] *= alpha1;
+    }
+}
+
+
+template<int Br, int Bc, int D>
+__device__ __forceinline__ void mma_pv_accum_reg_f32p_f16v(
+    const float*  __restrict__ P,      // P: Br x Bc, float
+    const __half* __restrict__ V,      // V: Bc x D, half
+    float*        __restrict__ Oacc,   // register array: O_TILES_PER_WARP * 4
+    int M,
+    int K,
+    int N,
+    int P_STRIDE,   
+    int V_STRIDE
+)
+{
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    int group = lane >> 2;   // 0..7
+    int tid4  = lane & 3;    // 0..3
+
+    constexpr int WARPS = 4;
+    constexpr int MMA_M = 16;
+    constexpr int MMA_N = 8;
+    constexpr int MMA_K = 16;
+
+    constexpr int O_M_TILES = (Br + MMA_M - 1) / MMA_M;
+    constexpr int O_N_TILES = (D  + MMA_N - 1) / MMA_N;
+    constexpr int O_TOTAL_TILES = O_M_TILES * O_N_TILES;
+
+    constexpr int O_TILES_PER_WARP = (O_TOTAL_TILES + WARPS - 1) / WARPS;
+
+    #pragma unroll
+    for (int t = 0; t < O_TILES_PER_WARP; t++)
+    {
+        // Correct tile assignment
+        int tile_idx = warp + t * WARPS;
+
+        if (tile_idx >= O_TOTAL_TILES) continue;
+
+        int mt = tile_idx / O_N_TILES;
+        int nt = tile_idx % O_N_TILES;
+
+        int row_start = mt * MMA_M;   // output row block
+        int col_start = nt * MMA_N;   // output col block
+
+        // Load current register accumulator for this tile
+        float d[4];
+        d[0] = Oacc[t * 4 + 0];
+        d[1] = Oacc[t * 4 + 1];
+        d[2] = Oacc[t * 4 + 2];
+        d[3] = Oacc[t * 4 + 3];
+
+        #pragma unroll
+        for (int k_start = 0; k_start < Bc; k_start += MMA_K)
+        {
+            uint32_t a_frag[4];
+            uint32_t b_frag[2];
+
+            // For A/P fragment
+            int k0 = k_start + tid4 * 2;
+
+            int a_row0 = row_start + group;
+            int a_row1 = row_start + group + 8;
+
+            float p00 = (a_row0 < M && k0     < K) ? P[a_row0 * P_STRIDE + k0]     : 0.f;
+            float p01 = (a_row0 < M && k0 + 1 < K) ? P[a_row0 * P_STRIDE + k0 + 1] : 0.f;
+
+            float p10 = (a_row1 < M && k0     < K) ? P[a_row1 * P_STRIDE + k0]     : 0.f;
+            float p11 = (a_row1 < M && k0 + 1 < K) ? P[a_row1 * P_STRIDE + k0 + 1] : 0.f;
+
+            float p20 = (a_row0 < M && k0 + 8 < K) ? P[a_row0 * P_STRIDE + k0 + 8] : 0.f;
+            float p21 = (a_row0 < M && k0 + 9 < K) ? P[a_row0 * P_STRIDE + k0 + 9] : 0.f;
+
+            float p30 = (a_row1 < M && k0 + 8 < K) ? P[a_row1 * P_STRIDE + k0 + 8] : 0.f;
+            float p31 = (a_row1 < M && k0 + 9 < K) ? P[a_row1 * P_STRIDE + k0 + 9] : 0.f;
+
+            a_frag[0] = pack_float2_to_half2_u32(p00, p01);
+            a_frag[1] = pack_float2_to_half2_u32(p10, p11);
+            a_frag[2] = pack_float2_to_half2_u32(p20, p21);
+            a_frag[3] = pack_float2_to_half2_u32(p30, p31);
+
+            // For B/V fragment
+            int out_col = col_start + group;
+
+            __half v00 = (k0     < K && out_col < N)
+                ? V[(k0)     * V_STRIDE + out_col]
+                : __float2half(0.f);
+
+            __half v01 = (k0 + 1 < K && out_col < N)
+                ? V[(k0 + 1) * V_STRIDE + out_col]
+                : __float2half(0.f);
+
+            __half v10 = (k0 + 8 < K && out_col < N)
+                ? V[(k0 + 8) * V_STRIDE + out_col]
+                : __float2half(0.f);
+
+            __half v11 = (k0 + 9 < K && out_col < N)
+                ? V[(k0 + 9) * V_STRIDE + out_col]
+                : __float2half(0.f);
+
+            b_frag[0] = pack_half2_u32(v00, v01);
+            b_frag[1] = pack_half2_u32(v10, v11);
+
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%0, %1, %2, %3};\n"
+                : "+f"(d[0]), "+f"(d[1]),
+                  "+f"(d[2]), "+f"(d[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]),
+                  "r"(a_frag[2]), "r"(a_frag[3]),
+                  "r"(b_frag[0]), "r"(b_frag[1])
+            );
+        }
+
+        // Store back into register accumulator array
+        Oacc[t * 4 + 0] = d[0];
+        Oacc[t * 4 + 1] = d[1];
+        Oacc[t * 4 + 2] = d[2];
+        Oacc[t * 4 + 3] = d[3];
+    }
+}
+
+//// this is for when O is in shared mem
 __device__ __forceinline__ void mma_pv_accum_f32p_f16v(
     const float*  __restrict__ P,
     const __half* __restrict__ V,
