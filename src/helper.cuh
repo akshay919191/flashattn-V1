@@ -203,14 +203,14 @@ __device__ __forceinline__ uint32_t pack_float2_to_half2_u32(float x, float y)
 
 template<int Br, int D>
 __device__ __forceinline__ void oaccSCALING(
-    float* Oacc,
-    const float* __restrict__ Alpha
+    float* __restrict__ Oreg,
+    const float* __restrict__ Alphasmem
 )
 {
     int tid   = threadIdx.x;
-    int lane  = tid & 31;
     int warp  = tid >> 5;
-    int group = lane >> 2;
+    int lane  = tid & 31;
+    int group = lane >> 2;   // 0..7
 
     constexpr int WARPS = 4;
     constexpr int MMA_M = 16;
@@ -218,28 +218,34 @@ __device__ __forceinline__ void oaccSCALING(
 
     constexpr int NUM_M_TILES = (Br + MMA_M - 1) / MMA_M;
     constexpr int NUM_N_TILES = (D  + MMA_N - 1) / MMA_N;
+
     constexpr int TOTAL_O_TILES = NUM_M_TILES * NUM_N_TILES;
-    constexpr int O_TILES_PER_WARP = (TOTAL_O_TILES + WARPS - 1) / WARPS;
+
+    constexpr int O_TILES_PER_WARP =
+        (TOTAL_O_TILES + WARPS - 1) / WARPS;
 
     #pragma unroll 1
-    for (int t = 0; t < O_TILES_PER_WARP; t++) {
+    for (int t = 0; t < O_TILES_PER_WARP; t++)
+    {
         int tile_idx = warp + t * WARPS;
 
         if (tile_idx >= TOTAL_O_TILES) continue;
 
         int mt = tile_idx / NUM_N_TILES;
+
         int row_start = mt * MMA_M;
 
         int r0 = row_start + group;
         int r1 = row_start + group + 8;
 
-        float alpha0 = (r0 < Br) ? Alpha[r0] : 0.0f;
-        float alpha1 = (r1 < Br) ? Alpha[r1] : 0.0f;
+        float alpha0 = (r0 < Br) ? Alphasmem[r0] : 0.0f;
+        float alpha1 = (r1 < Br) ? Alphasmem[r1] : 0.0f;
 
-        Oacc[t * 4 + 0] *= alpha0;
-        Oacc[t * 4 + 1] *= alpha0;
-        Oacc[t * 4 + 2] *= alpha1;
-        Oacc[t * 4 + 3] *= alpha1;
+        Oreg[t * 4 + 0] *= alpha0;
+        Oreg[t * 4 + 1] *= alpha0;
+
+        Oreg[t * 4 + 2] *= alpha1;
+        Oreg[t * 4 + 3] *= alpha1;
     }
 }
 

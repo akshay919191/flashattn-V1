@@ -1,17 +1,45 @@
+# VS Code
+.vscode/
 
-# Aider AI files
-.aider*
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
-# Profiling reports (Nsight Compute / Systems)
+# PyTorch/CUDA extension build outputs
+build/
+dist/
+*.egg-info/
+*.so
+
+*.o
+*.out
+*.a
+
+# CUDA generated/intermediate files
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+
+# Profiling reports
+profiles/
 *.ncu-rep
 *.nsys-rep
+*.qdrep
+*.sqlite
 
-# Python cache & compiled files (from running benchmarks)
-__pycache__/
-*.pyc
+# Logs
+*.log
 
-# Build outputs (if you compile binaries or libraries)
-build/
-bin/
-*.out
-*.o
+# Virtual envs
+venv/
+.venv/
+env/
+
+# OS junk
+.DS_Store
