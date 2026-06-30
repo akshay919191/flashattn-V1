@@ -12,7 +12,7 @@ torch.manual_seed(0)
 
 B = 1
 H = 8
-N = 512
+N = 1024
 D = 128
 
 Q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16).contiguous()

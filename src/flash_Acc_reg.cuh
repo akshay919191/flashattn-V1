@@ -22,13 +22,14 @@ __device__ __forceinline__ float warp_reduce_sum(float x)
     }
     return x;
 }
-template<int Br, int Bc, int NUM_HEADS, int D, int N>
+template<int Br, int Bc, int D>
 __global__ void flashattn_fwd_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
           __half* __restrict__ output,
-          float*  __restrict__ Logsum
+          float*  __restrict__ Logsum,
+          int N
 )
 {
     const int tid   = threadIdx.x;
@@ -146,13 +147,13 @@ __global__ void flashattn_fwd_kernel(
     const int headid  = blockIdx.y;
     const int rowid   = blockIdx.z;
 
+    const int H_runtime = gridDim.y;
+
     const long long base =
-        (long long)batchid * NUM_HEADS * N * D +
-        (long long)headid  * N * D;
-    
+        ((long long)batchid * H_runtime + headid) * N * D;
+
     const long long statbase =
-    (long long)batchid * NUM_HEADS * N +
-    (long long)headid  * N;
+        ((long long)batchid * H_runtime + headid) * N;
 
     const __half* Qptr = Q + base;
     const __half* Kptr = K + base;
@@ -468,7 +469,7 @@ __global__ void calc_delta_kernel(
 
 /// backward pass
 
-template<int Br, int Bc, int NUM_HEADS, int D, int N>
+template<int Br, int Bc, int D>
 __global__ void flashattn_bwd_dkdv_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -477,7 +478,8 @@ __global__ void flashattn_bwd_dkdv_kernel(
     const float*  __restrict__ L,
     const float*  __restrict__ delta,
           __half* __restrict__ DK,
-          __half* __restrict__ DV
+          __half* __restrict__ DV,
+          int N
 )
 {
 
@@ -566,13 +568,13 @@ __global__ void flashattn_bwd_dkdv_kernel(
     const int headid  = blockIdx.y;
     const int kvid    = blockIdx.z;
 
+    const int H_runtime = gridDim.y;
+
     const long long base =
-        (long long)batchid * NUM_HEADS * N * D +
-        (long long)headid  * N * D;
+        ((long long)batchid * H_runtime + headid) * N * D;
 
     const long long statbase =
-        (long long)batchid * NUM_HEADS * N +
-        (long long)headid  * N;
+        ((long long)batchid * H_runtime + headid) * N;
 
     const __half* Qptr  = Q  + base;
     const __half* Kptr  = K  + base;
@@ -846,7 +848,7 @@ __global__ void flashattn_bwd_dkdv_kernel(
 }
 
 
-template<int Br, int Bc, int NUM_HEADS, int D, int N>
+template<int Br, int Bc, int D>
 __global__ void flashattn_bwd_dq_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -854,7 +856,8 @@ __global__ void flashattn_bwd_dq_kernel(
     const __half* __restrict__ DO,
     const float*  __restrict__ L,
     const float*  __restrict__ delta,
-          __half* __restrict__ DQ
+          __half* __restrict__ DQ,
+          int N
 )
 {
     const int tid   = threadIdx.x;
@@ -940,13 +943,13 @@ __global__ void flashattn_bwd_dq_kernel(
     const int headid  = blockIdx.y;
     const int qid     = blockIdx.z;
 
-    const long long base =
-        (long long)batchid * NUM_HEADS * N * D +
-        (long long)headid  * N * D;
+    int H_runtime = gridDim.y;
 
-    const long long statbase =
-        (long long)batchid * NUM_HEADS * N +
-        (long long)headid  * N;
+    long long base =
+        ((long long)blockIdx.x * H_runtime + blockIdx.y) * N * D;
+
+    long long statbase =
+        ((long long)blockIdx.x * H_runtime + blockIdx.y) * N;
 
     const __half* Qptr  = Q  + base;
     const __half* Kptr  = K  + base;

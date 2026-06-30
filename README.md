@@ -2,24 +2,41 @@
 
 A from-scratch CUDA implementation of FlashAttention forward and backward.
 
-This repo is mainly for learning and experimenting with CUDA kernels, MMA, shared memory, PyTorch extensions, and attention backward math. It is not a production FlashAttention replacement and it is not faster than PyTorch SDPA yet.
+This repo is mainly for learning CUDA kernels, MMA, shared memory, PyTorch extensions, and attention backward math. It is not a production FlashAttention replacement and it is not faster than PyTorch SDPA yet.
 
-Tested on:
+## Supported Shapes
+
+Current support:
+
+```text
+dtype: fp16
+B: dynamic
+H: dynamic
+N: dynamic
+D: 32, 64, 128, 256
+attention: non-causal
+dropout: no
+```
+
+`N` is runtime dynamic.
+
+`D` is not fully runtime dynamic. It is handled by dispatching to compiled kernel specializations:
+
+```text
+D = 32
+D = 64
+D = 128
+D = 256
+```
+
+So this supports many practical shapes, but not arbitrary head dimensions yet.
+
+Tested mainly on:
 
 ```text
 GPU: RTX 3050 Laptop GPU
 CUDA arch: sm_86
 CUDA: 11.8
-dtype: fp16
-```
-
-Current fixed benchmark shape:
-
-```text
-B = 1
-H = 8
-N = 512
-D = 128
 ```
 
 ---
@@ -30,7 +47,7 @@ Forward pass works.
 
 Backward pass works.
 
-The backward pass currently uses 3 kernels:
+Backward is split into 3 kernels:
 
 ```text
 1. Delta kernel
@@ -38,26 +55,42 @@ The backward pass currently uses 3 kernels:
 3. DQ kernel
 ```
 
-`Delta` is:
+Delta is:
 
 ```text
 Delta = sum(O * dO, dim=-1)
 ```
 
-This split keeps ownership simple:
+The split keeps output ownership simple:
 
 ```text
 DK/DV kernel owns KV tiles
 DQ kernel owns Q tiles
 ```
 
-No atomics are used.
+No atomic adds are used.
+
+---
+
+## Benchmark Shape
+
+The benchmark numbers below are from this shape:
+
+```text
+B = 1
+H = 8
+N = 512
+D = 128
+dtype = fp16
+```
+
+Results will change for other shapes and GPUs.
 
 ---
 
 ## Results
 
-### Forward correctness
+### Forward Correctness
 
 Compared against PyTorch scaled dot product attention.
 
@@ -67,7 +100,7 @@ L max err: ~0.000001
 bad count > 0.05: 0
 ```
 
-### Forward benchmark
+### Forward Benchmark
 
 ```text
 custom forward: ~0.6487 ms
@@ -75,7 +108,7 @@ torch sdpa:      ~0.0865 ms
 ratio:           ~7.5x slower
 ```
 
-### Backward correctness
+### Backward Correctness
 
 Compared against PyTorch SDPA backward.
 
@@ -88,7 +121,7 @@ bad > 0.01: 0 for DQ, DK, DV
 NaN: False for DQ, DK, DV
 ```
 
-### Backward benchmark
+### Backward Benchmark
 
 ```text
 custom backward: 1.9782 ms
@@ -96,7 +129,7 @@ torch backward:  0.3689 ms
 ratio custom/torch: 5.36x
 ```
 
-These numbers are from my RTX 3050 Laptop GPU. They will change on other GPUs.
+The custom implementation is slower than PyTorch right now. The goal of this repo is correctness, kernel structure, profiling, and learning.
 
 ---
 
@@ -144,9 +177,7 @@ MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" python setup.py build_ext --inplace
 
 This creates a local `.so` extension file in the repo root.
 
-Because the extension is built locally, run scripts with `PYTHONPATH=.`.
-
-Example:
+Because the extension is built locally, run scripts with `PYTHONPATH=.`:
 
 ```bash
 PYTHONPATH=. python benchmarks/correctness_fwd.py
@@ -154,7 +185,7 @@ PYTHONPATH=. python benchmarks/correctness_fwd.py
 
 ---
 
-## Run Correctness Tests
+## Correctness Tests
 
 Forward:
 
@@ -189,7 +220,7 @@ DV
 
 ---
 
-## Run Benchmarks
+## Benchmarks
 
 Forward benchmark:
 
@@ -203,7 +234,7 @@ Backward benchmark:
 PYTHONPATH=. python benchmarks/bench_bwd.py
 ```
 
-Current backward result:
+Current backward benchmark on RTX 3050 Laptop GPU:
 
 ```text
 custom backward: 1.9782 ms
@@ -277,19 +308,19 @@ dK = dS^T @ Q
 
 ## Limitations
 
-This is still a scratch implementation.
-
 Current limitations:
 
 ```text
-- fixed shape only: B=1, H=8, N=512, D=128
 - fp16 only
+- D supports only 32, 64, 128, 256
 - non-causal only
 - no dropout
-- no variable sequence lengths
+- no variable-length packed sequences
 - not faster than PyTorch SDPA
 - not packaged as a general library
 ```
+
+The current code is a scratch implementation for learning and profiling, not a production-ready attention library.
 
 ---
 
@@ -298,19 +329,19 @@ Current limitations:
 Possible improvements:
 
 ```text
-- support more shapes
 - add causal masking
-- benchmark more configs
+- add more D specializations
+- benchmark more N/D configs
 - profile backward kernels
 - reduce shared memory usage
 - reduce kernel launch overhead
-- optimize occupancy
+- improve occupancy
 - clean up API
 ```
 
 ---
 
-## Notes
+## Git Notes
 
 Generated files should not be committed:
 
