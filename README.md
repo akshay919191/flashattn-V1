@@ -2,7 +2,11 @@
 
 A from-scratch CUDA implementation of FlashAttention forward and backward.
 
-This repo is mainly for learning CUDA kernels, MMA, shared memory, PyTorch extensions, and attention backward math. It is not a production FlashAttention replacement and it is not faster than PyTorch SDPA yet.
+This repo is for learning and experimenting with CUDA kernels, MMA, shared memory, PyTorch extensions, online softmax, and attention backward math.
+
+It is not a production FlashAttention replacement. The current forward pass is competitive with PyTorch SDPA on one tested long-sequence shape, but backward is still slower.
+
+---
 
 ## Supported Shapes
 
@@ -10,9 +14,9 @@ Current support:
 
 ```text
 dtype: fp16
-B: dynamic
-H: dynamic
-N: dynamic
+B: runtime dynamic
+H: runtime dynamic
+N: runtime dynamic
 D: 32, 64, 128, 256
 attention: non-causal
 dropout: no
@@ -20,7 +24,7 @@ dropout: no
 
 `N` is runtime dynamic.
 
-`D` is not fully runtime dynamic. It is handled by dispatching to compiled kernel specializations:
+`D` is handled through compiled specializations:
 
 ```text
 D = 32
@@ -29,25 +33,29 @@ D = 128
 D = 256
 ```
 
-So this supports many practical shapes, but not arbitrary head dimensions yet.
+So the implementation supports common head dimensions, but not arbitrary head dimensions yet.
 
 Tested mainly on:
 
 ```text
-GPU: RTX 3050 Laptop GPU
+GPU: NVIDIA RTX 3050 6GB Laptop GPU
 CUDA arch: sm_86
 CUDA: 11.8
+PyTorch: 2.7.1+cu118
 ```
 
 ---
 
-## Status
+## Current Status
 
-Forward pass works.
+```text
+forward: working
+backward: working
+dtype: fp16
+attention type: non-causal
+```
 
-Backward pass works.
-
-Backward is split into 3 kernels:
+Backward is split into three kernels:
 
 ```text
 1. Delta kernel
@@ -61,56 +69,115 @@ Delta is:
 Delta = sum(O * dO, dim=-1)
 ```
 
-The split keeps output ownership simple:
+The split keeps ownership simple:
 
 ```text
 DK/DV kernel owns KV tiles
 DQ kernel owns Q tiles
 ```
 
-No atomic adds are used.
+No atomic adds are used in the current backward path.
 
 ---
 
-## Benchmark Shape
+## Latest Benchmark Shape
 
-The benchmark numbers below are from this shape:
+Latest benchmark shape:
 
 ```text
 B = 1
 H = 8
-N = 512
-D = 128
+N = 4096
+D = 64
 dtype = fp16
+attention = non-causal
 ```
 
-Results will change for other shapes and GPUs.
+Results will change for other shapes, GPUs, CUDA versions, and PyTorch SDPA backend choices.
 
 ---
 
-## Results
+## Latest Forward Benchmark
 
-### Forward Correctness
+Compared against PyTorch SDPA.
 
-Compared against PyTorch scaled dot product attention.
-
-```text
-O max err: ~0.00024
-L max err: ~0.000001
-bad count > 0.05: 0
-```
-
-### Forward Benchmark
+Run 1:
 
 ```text
-custom forward: ~0.6487 ms
-torch sdpa:      ~0.0865 ms
-ratio:           ~7.5x slower
+custom:     2.8547 ms
+torch sdpa: 3.0663 ms
+ratio custom/torch: 0.931x
 ```
 
-### Backward Correctness
+Run 2:
+
+```text
+custom:     2.7367 ms
+torch sdpa: 3.5133 ms
+ratio custom/torch: 0.779x
+```
+
+Run 3:
+
+```text
+custom:     2.8311 ms
+torch sdpa: 3.0599 ms
+ratio custom/torch: 0.925x
+```
+
+For this tested shape, the custom forward is faster than PyTorch SDPA in these runs.
+
+Approximate range:
+
+```text
+custom forward: 2.74 ms - 2.85 ms
+torch SDPA:     3.06 ms - 3.51 ms
+ratio:          0.78x - 0.93x custom/torch
+```
+
+A ratio below `1.0x` means the custom kernel is faster for that run.
+
+---
+
+## Latest Backward Benchmark
 
 Compared against PyTorch SDPA backward.
+
+Run 1:
+
+```text
+custom backward: 2.2210 ms
+torch backward:  0.8881 ms
+ratio custom/torch: 2.50x
+```
+
+Run 2:
+
+```text
+custom backward: 2.2279 ms
+torch backward:  0.8934 ms
+ratio custom/torch: 2.49x
+```
+
+The backward pass is still slower than PyTorch SDPA backward.
+
+Current backward status:
+
+```text
+custom backward: about 2.22 ms
+torch backward:  about 0.89 ms
+ratio:           about 2.5x slower
+```
+
+---
+
+## Correctness
+
+Forward is compared against PyTorch scaled dot product attention.
+
+Backward is compared against PyTorch SDPA backward.
+
+Typical backward correctness result:
 
 ```text
 DQ max err: 0.00048828125
@@ -121,15 +188,7 @@ bad > 0.01: 0 for DQ, DK, DV
 NaN: False for DQ, DK, DV
 ```
 
-### Backward Benchmark
-
-```text
-custom backward: 1.9782 ms
-torch backward:  0.3689 ms
-ratio custom/torch: 5.36x
-```
-
-The custom implementation is slower than PyTorch right now. The goal of this repo is correctness, kernel structure, profiling, and learning.
+The current implementation passes the tested fp16 tolerances.
 
 ---
 
@@ -177,7 +236,7 @@ MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" python setup.py build_ext --inplace
 
 This creates a local `.so` extension file in the repo root.
 
-Because the extension is built locally, run scripts with `PYTHONPATH=.`:
+Because the extension is built locally, run scripts with:
 
 ```bash
 PYTHONPATH=. python benchmarks/correctness_fwd.py
@@ -204,17 +263,17 @@ Expected backward output should look roughly like:
 ```text
 DQ
   has nan: False
-  max err: 0.00048828125
+  max err: around 0.0005
   bad > 0.01: 0
 
 DK
   has nan: False
-  max err: 0.00048828125
+  max err: around 0.0005
   bad > 0.01: 0
 
 DV
   has nan: False
-  max err: 0.000244140625
+  max err: around 0.0003
   bad > 0.01: 0
 ```
 
@@ -234,12 +293,22 @@ Backward benchmark:
 PYTHONPATH=. python benchmarks/bench_bwd.py
 ```
 
-Current backward benchmark on RTX 3050 Laptop GPU:
+Latest forward benchmark on RTX 3050 Laptop GPU:
 
 ```text
-custom backward: 1.9782 ms
-torch backward:  0.3689 ms
-ratio custom/torch: 5.36x
+B=1, H=8, N=4096, D=64
+
+custom forward: 2.74 ms - 2.85 ms
+torch SDPA:     3.06 ms - 3.51 ms
+ratio:          0.78x - 0.93x custom/torch
+```
+
+Latest backward benchmark on RTX 3050 Laptop GPU:
+
+```text
+custom backward: about 2.22 ms
+torch backward:  about 0.89 ms
+ratio:           about 2.5x custom/torch
 ```
 
 ---
@@ -306,9 +375,7 @@ dK = dS^T @ Q
 
 ---
 
-## Limitations
-
-Current limitations:
+## Current Limitations
 
 ```text
 - fp16 only
@@ -316,11 +383,39 @@ Current limitations:
 - non-causal only
 - no dropout
 - no variable-length packed sequences
-- not faster than PyTorch SDPA
+- no bf16 path
+- no GQA/MQA support
 - not packaged as a general library
+- backward is still slower than PyTorch SDPA
 ```
 
-The current code is a scratch implementation for learning and profiling, not a production-ready attention library.
+The current code is a scratch implementation for learning, profiling, and optimization work.
+
+---
+
+## Optimization Notes
+
+Current forward is already competitive on the tested long-sequence shape:
+
+```text
+B=1, H=8, N=4096, D=64
+```
+
+The main remaining target is backward.
+
+Likely backward bottlenecks:
+
+```text
+extra kernel launches
+Delta/DKDV/DQ split overhead
+shared memory usage
+register pressure
+recomputing attention probabilities
+MMA utilization
+global memory movement
+```
+
+The current backward avoids atomic adds by splitting ownership, but this also means multiple kernels and more scheduling overhead.
 
 ---
 
@@ -330,13 +425,28 @@ Possible improvements:
 
 ```text
 - add causal masking
-- add more D specializations
 - benchmark more N/D configs
-- profile backward kernels
-- reduce shared memory usage
-- reduce kernel launch overhead
+- profile backward kernels separately
+- reduce backward kernel launch overhead
 - improve occupancy
+- reduce shared memory usage
+- improve register pressure
+- tune D=64 path more aggressively
+- tune D=128 and D=256 separately
+- add cleaner benchmark summary
+- add PyTorch SDPA backend notes
 - clean up API
+```
+
+Longer-term possible work:
+
+```text
+- bf16 support
+- dropout
+- GQA/MQA
+- variable-length packed sequences
+- sliding-window attention
+- better autograd wrapper
 ```
 
 ---
