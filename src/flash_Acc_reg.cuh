@@ -145,6 +145,7 @@ __global__ void flashattn_fwd_kernel(
                 s3 = -FLT_MAX;
             }
 
+            // Store scaled and masked scores for the P calculation.
             S_frag[kb * 4 + 0] = s0;
             S_frag[kb * 4 + 1] = s1;
             S_frag[kb * 4 + 2] = s2;
@@ -279,16 +280,34 @@ __global__ void calc_delta_kernel(
     float*        __restrict__ Delta,
     int total_rows
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    // One warp handles one row. This turns the old strided per-thread loads
+    // into coalesced accesses and parallelizes the D-element dot product.
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const int row = blockIdx.x * warps_per_block + warp_in_block;
+
     if (row < total_rows) {
-        const __half* o_row = O + (size_t)row * D;
-        const __half* do_row = dO + (size_t)row * D;
-        
-        float delta = 0.0f;
-        for (int i = 0; i < D; i++) {
-            delta += __half2float(o_row[i]) * __half2float(do_row[i]);
+        const __half* o_row = O + static_cast<size_t>(row) * D;
+        const __half* do_row = dO + static_cast<size_t>(row) * D;
+
+        float sum = 0.0f;
+
+        #pragma unroll
+        for (int col = lane; col < D; col += 32) {
+            sum +=
+                __half2float(o_row[col]) *
+                __half2float(do_row[col]);
         }
-        Delta[row] = delta;
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+
+        if (lane == 0) {
+            Delta[row] = sum;
+        }
     }
 }
 
@@ -303,8 +322,7 @@ __global__ void flashattn_bwd_dkdv_kernel(
           __half* __restrict__ DK,
           __half* __restrict__ DV,
           int N
-) 
-{
+) {
     static_assert(Br > 0 && Br % 16 == 0,
                   "Backward kernels require Br divisible by 16");
     static_assert(Bc > 0 && Bc % 16 == 0,
@@ -314,68 +332,83 @@ __global__ void flashattn_bwd_dkdv_kernel(
 
     if (blockDim.x != 128) return;
 
-    const int tid   = threadIdx.x;
-    const float SCALE = 1.0f / sqrtf((float)D);
+    const int tid = threadIdx.x;
+    const float SCALE = 1.0f / sqrtf(static_cast<float>(D));
 
     extern __shared__ char smem_raw[];
     char* ptr = smem_raw;
 
     auto align = [&](char*& p, size_t a = 16) {
-        p = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(p) + a - 1) & ~(a - 1));
+        p = reinterpret_cast<char*>(
+            (reinterpret_cast<uintptr_t>(p) + a - 1) & ~(a - 1)
+        );
     };
 
     constexpr int PAD = 8;
-    constexpr int Q_STRIDE  = D + PAD;
-    constexpr int K_STRIDE  = D + PAD;
-    constexpr int V_STRIDE  = D + PAD;
+    constexpr int Q_STRIDE = D + PAD;
+    constexpr int K_STRIDE = D + PAD;
+    constexpr int V_STRIDE = D + PAD;
     constexpr int DO_STRIDE = D + PAD;
-    constexpr int S_STRIDE  = Bc + PAD;
+    constexpr int S_STRIDE = Bc + PAD;
 
     align(ptr);
-    __half* smemQ0 = reinterpret_cast<__half*>(ptr); ptr += Br * Q_STRIDE * sizeof(__half);
+    __half* smemQ0 = reinterpret_cast<__half*>(ptr);
+    ptr += Br * Q_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemQ1 = reinterpret_cast<__half*>(ptr); ptr += Br * Q_STRIDE * sizeof(__half);
+    __half* smemQ1 = reinterpret_cast<__half*>(ptr);
+    ptr += Br * Q_STRIDE * sizeof(__half);
     __half* smemQ[2] = {smemQ0, smemQ1};
 
     align(ptr);
-    __half* smemdO0 = reinterpret_cast<__half*>(ptr); ptr += Br * DO_STRIDE * sizeof(__half);
+    __half* smemdO0 = reinterpret_cast<__half*>(ptr);
+    ptr += Br * DO_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemdO1 = reinterpret_cast<__half*>(ptr); ptr += Br * DO_STRIDE * sizeof(__half);
+    __half* smemdO1 = reinterpret_cast<__half*>(ptr);
+    ptr += Br * DO_STRIDE * sizeof(__half);
     __half* smemdO[2] = {smemdO0, smemdO1};
 
     align(ptr);
-    __half* smemK = reinterpret_cast<__half*>(ptr); ptr += Bc * K_STRIDE * sizeof(__half);
+    __half* smemK = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * K_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemV = reinterpret_cast<__half*>(ptr); ptr += Bc * V_STRIDE * sizeof(__half);
+    __half* smemV = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * V_STRIDE * sizeof(__half);
 
     align(ptr);
-    float* dKacc = reinterpret_cast<float*>(ptr); ptr += Bc * K_STRIDE * sizeof(float);
+    float* WorkSmem = reinterpret_cast<float*>(ptr);
+    ptr += Br * S_STRIDE * sizeof(float);
     align(ptr);
-    float* dVacc = reinterpret_cast<float*>(ptr); ptr += Bc * V_STRIDE * sizeof(float);
+    __half* P_dS_smem = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * Br * sizeof(__half);
 
     align(ptr);
-    float* WorkSmem = reinterpret_cast<float*>(ptr); ptr += Br * S_STRIDE * sizeof(float);
+    float* Lsmem = reinterpret_cast<float*>(ptr);
+    ptr += Br * sizeof(float);
     align(ptr);
-    __half* P_dS_smem = reinterpret_cast<__half*>(ptr); ptr += Bc * Br * sizeof(__half);
+    float* Deltasmem = reinterpret_cast<float*>(ptr);
 
-    align(ptr);
-    float* Lsmem = reinterpret_cast<float*>(ptr); ptr += Br * sizeof(float);
-    align(ptr);
-    float* Deltasmem = reinterpret_cast<float*>(ptr); ptr += Br * sizeof(float);
+    constexpr int OUT_TILES = (Bc / 16) * (D / 8);
+    constexpr int TILES_PER_WARP = (OUT_TILES + 3) / 4;
+    constexpr int ACC_COUNT = TILES_PER_WARP * 4;
+
+    float dK_frag[ACC_COUNT] = {0.0f};
+    float dV_frag[ACC_COUNT] = {0.0f};
 
     const int batchid = blockIdx.x;
-    const int headid  = blockIdx.y;
-    const int kvid    = blockIdx.z;
+    const int headid = blockIdx.y;
+    const int kvid = blockIdx.z;
     const int H_runtime = gridDim.y;
 
-    const long long base = ((long long)batchid * H_runtime + headid) * N * D;
-    const long long statbase = ((long long)batchid * H_runtime + headid) * N;
+    const long long base =
+        (static_cast<long long>(batchid) * H_runtime + headid) * N * D;
+    const long long statbase =
+        (static_cast<long long>(batchid) * H_runtime + headid) * N;
 
-    const __half* Qptr  = Q  + base;
-    const __half* Kptr  = K  + base;
-    const __half* Vptr  = V  + base;
+    const __half* Qptr = Q + base;
+    const __half* Kptr = K + base;
+    const __half* Vptr = V + base;
     const __half* DOptr = DO + base;
-    const float* Lptr     = L     + statbase;
+    const float* Lptr = L + statbase;
     const float* Deltaptr = delta + statbase;
     __half* DKptr = DK + base;
     __half* DVptr = DV + base;
@@ -385,97 +418,133 @@ __global__ void flashattn_bwd_dkdv_kernel(
 
     if (kvid >= Tc) return;
 
-    for (int i = tid; i < Bc * K_STRIDE; i += blockDim.x) dKacc[i] = 0.0f;
-    for (int i = tid; i < Bc * V_STRIDE; i += blockDim.x) dVacc[i] = 0.0f;
+    // Two committed groups, one wait/barrier.
+    asyncLOAD_2D_TILE<Bc, D, 128>(
+        Kptr, smem_u32_ptr(smemK), tid, K_STRIDE,
+        N, D, D, kvid, 0
+    );
+    asyncLOAD_2D_TILE<Bc, D, 128>(
+        Vptr, smem_u32_ptr(smemV), tid, V_STRIDE,
+        N, D, D, kvid, 0
+    );
+    asm volatile("cp.async.commit_group;\n");
 
-    asyncLOAD_2D_TILE<Bc, D, 128>(Kptr, smem_u32_ptr(smemK), tid, K_STRIDE, N, D, D, kvid, 0);
-    asyncLOAD_2D_TILE<Bc, D, 128>(Vptr, smem_u32_ptr(smemV), tid, V_STRIDE, N, D, D, kvid, 0);
+    asyncLOAD_2D_TILE<Br, D, 128>(
+        Qptr, smem_u32_ptr(smemQ[0]), tid, Q_STRIDE,
+        N, D, D, 0, 0
+    );
+    asyncLOAD_2D_TILE<Br, D, 128>(
+        DOptr, smem_u32_ptr(smemdO[0]), tid, DO_STRIDE,
+        N, D, D, 0, 0
+    );
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
-    asyncLOAD_2D_TILE<Br, D, 128>(Qptr, smem_u32_ptr(smemQ[0]), tid, Q_STRIDE, N, D, D, 0, 0);
-    asyncLOAD_2D_TILE<Br, D, 128>(DOptr, smem_u32_ptr(smemdO[0]), tid, DO_STRIDE, N, D, D, 0, 0);
-    asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-    __syncthreads();
+    for (int qtile = 0; qtile < Tr; ++qtile) {
+        const int current_stage = qtile & 1;
+        const int next_stage = current_stage ^ 1;
+        const int next_qtile = qtile + 1;
 
-    for (int Qtileid = 0; Qtileid < Tr; Qtileid++) {
-        int curstage = Qtileid & 1;
-        int nextstage = curstage ^ 1;
-        int next_q = Qtileid + 1;
-
-        if (next_q < Tr) {
-            asyncLOAD_2D_TILE<Br, D, 128>(Qptr, smem_u32_ptr(smemQ[nextstage]), tid, Q_STRIDE, N, D, D, next_q, 0);
-            asyncLOAD_2D_TILE<Br, D, 128>(DOptr, smem_u32_ptr(smemdO[nextstage]), tid, DO_STRIDE, N, D, D, next_q, 0);
+        if (next_qtile < Tr) {
+            asyncLOAD_2D_TILE<Br, D, 128>(
+                Qptr, smem_u32_ptr(smemQ[next_stage]), tid, Q_STRIDE,
+                N, D, D, next_qtile, 0
+            );
+            asyncLOAD_2D_TILE<Br, D, 128>(
+                DOptr, smem_u32_ptr(smemdO[next_stage]), tid, DO_STRIDE,
+                N, D, D, next_qtile, 0
+            );
             asm volatile("cp.async.commit_group;\n");
         }
 
         for (int r = tid; r < Br; r += blockDim.x) {
-            int global_q = Qtileid * Br + r;
+            const int global_q = qtile * Br + r;
             if (global_q < N) {
-                Lsmem[r]     = Lptr[global_q];
+                Lsmem[r] = Lptr[global_q];
                 Deltasmem[r] = Deltaptr[global_q];
             } else {
-                Lsmem[r]     = 0.0f;
+                Lsmem[r] = 0.0f;
                 Deltasmem[r] = 0.0f;
             }
         }
-        __syncthreads();
 
-        mma_score_strided(smemQ[curstage], smemK, WorkSmem, Br, D, Bc, Q_STRIDE, K_STRIDE, S_STRIDE);
+        mma_score_f16_tiled<
+            Br, D, Bc, Q_STRIDE, K_STRIDE, S_STRIDE
+        >(smemQ[current_stage], smemK, WorkSmem);
         __syncthreads();
 
         for (int idx = tid; idx < Br * Bc; idx += blockDim.x) {
-            int r = idx / Bc; int c = idx % Bc;
-            int global_q = Qtileid * Br + r; int global_k = kvid * Bc + c;
+            const int r = idx / Bc;
+            const int c = idx % Bc;
+            const int global_q = qtile * Br + r;
+            const int global_k = kvid * Bc + c;
+
             float p = 0.0f;
             if (global_q < N && global_k < N) {
-                float score = WorkSmem[r * S_STRIDE + c];
-                p = __expf(score * SCALE - Lsmem[r]);
+                p = __expf(
+                    WorkSmem[r * S_STRIDE + c] * SCALE - Lsmem[r]
+                );
             }
             P_dS_smem[c * Br + r] = __float2half(p);
         }
         __syncthreads();
 
-        mma_accum_f16p_f16v_smem(P_dS_smem, smemdO[curstage], dVacc, Bc, Br, D, Br, DO_STRIDE, V_STRIDE);
-        __syncthreads();
+        mma_accum_f16_registers<
+            Bc, Br, D, Br, DO_STRIDE, ACC_COUNT
+        >(
+            P_dS_smem,
+            smemdO[current_stage],
+            dV_frag
+        );
 
-        mma_score_strided(smemdO[curstage], smemV, WorkSmem, Br, D, Bc, DO_STRIDE, V_STRIDE, S_STRIDE);
+        mma_score_f16_tiled<
+            Br, D, Bc, DO_STRIDE, V_STRIDE, S_STRIDE
+        >(smemdO[current_stage], smemV, WorkSmem);
         __syncthreads();
 
         for (int idx = tid; idx < Br * Bc; idx += blockDim.x) {
-            int r = idx / Bc; int c = idx % Bc;
-            int global_q = Qtileid * Br + r; int global_k = kvid * Bc + c;
+            const int r = idx / Bc;
+            const int c = idx % Bc;
+            const int global_q = qtile * Br + r;
+            const int global_k = kvid * Bc + c;
+
             float ds = 0.0f;
             if (global_q < N && global_k < N) {
-                float dp = WorkSmem[r * S_STRIDE + c];
-                float p  = __half2float(P_dS_smem[c * Br + r]);
+                const float dp = WorkSmem[r * S_STRIDE + c];
+                const float p =
+                    __half2float(P_dS_smem[c * Br + r]);
                 ds = p * (dp - Deltasmem[r]) * SCALE;
             }
             P_dS_smem[c * Br + r] = __float2half(ds);
         }
         __syncthreads();
 
-        mma_accum_f16p_f16v_smem(P_dS_smem, smemQ[curstage], dKacc, Bc, Br, D, Br, Q_STRIDE, K_STRIDE);
-        __syncthreads();
+        mma_accum_f16_registers<
+            Bc, Br, D, Br, Q_STRIDE, ACC_COUNT
+        >(
+            P_dS_smem,
+            smemQ[current_stage],
+            dK_frag
+        );
 
-        if (next_q < Tr) {
+        if (next_qtile < Tr) {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             __syncthreads();
         }
     }
 
-    for (int i = tid; i < Bc * D; i += blockDim.x) {
-        int r = i / D; int c = i % D;
-        int global_r = kvid * Bc + r;
-        if (global_r < N && c < D) {
-            DKptr[(size_t)global_r * D + c] = __float2half(dKacc[r * K_STRIDE + c]);
-            DVptr[(size_t)global_r * D + c] = __float2half(dVacc[r * V_STRIDE + c]);
-        }
-    }
+    store_f16_registers<Bc, D, ACC_COUNT>(
+        dK_frag, DKptr, kvid * Bc, N, D
+    );
+    store_f16_registers<Bc, D, ACC_COUNT>(
+        dV_frag, DVptr, kvid * Bc, N, D
+    );
 }
 
+// ----------------------------------------------------------------------------
+// Backward dQ kernel
+// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 __global__ void flashattn_bwd_dq_kernel(
     const __half* __restrict__ Q,
@@ -486,8 +555,7 @@ __global__ void flashattn_bwd_dq_kernel(
     const float*  __restrict__ delta,
           __half* __restrict__ DQ,
           int N
-) 
-{
+) {
     static_assert(Br > 0 && Br % 16 == 0,
                   "Backward kernels require Br divisible by 16");
     static_assert(Bc > 0 && Bc % 16 == 0,
@@ -495,70 +563,84 @@ __global__ void flashattn_bwd_dq_kernel(
     static_assert(D > 0 && D % 16 == 0,
                   "Backward kernels require D divisible by 16");
 
-    // The asynchronous loaders below are specialized for 128 threads.
-    // This condition is uniform across the block, so returning is barrier-safe.
     if (blockDim.x != 128) return;
 
-    const int tid   = threadIdx.x;
-    const float SCALE = 1.0f / sqrtf((float)D);
+    const int tid = threadIdx.x;
+    const float SCALE = 1.0f / sqrtf(static_cast<float>(D));
 
     extern __shared__ char smem_raw[];
     char* ptr = smem_raw;
 
     auto align = [&](char*& p, size_t a = 16) {
-        p = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(p) + a - 1) & ~(a - 1));
+        p = reinterpret_cast<char*>(
+            (reinterpret_cast<uintptr_t>(p) + a - 1) & ~(a - 1)
+        );
     };
 
     constexpr int PAD = 8;
-    constexpr int Q_STRIDE  = D + PAD;
-    constexpr int K_STRIDE  = D + PAD;
-    constexpr int V_STRIDE  = D + PAD;
+    constexpr int Q_STRIDE = D + PAD;
+    constexpr int K_STRIDE = D + PAD;
+    constexpr int V_STRIDE = D + PAD;
     constexpr int DO_STRIDE = D + PAD;
-    constexpr int S_STRIDE  = Bc + PAD;
+    constexpr int S_STRIDE = Bc + PAD;
 
     align(ptr);
-    __half* smemQ = reinterpret_cast<__half*>(ptr); ptr += Br * Q_STRIDE * sizeof(__half);
+    __half* smemQ = reinterpret_cast<__half*>(ptr);
+    ptr += Br * Q_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemdO = reinterpret_cast<__half*>(ptr); ptr += Br * DO_STRIDE * sizeof(__half);
+    __half* smemdO = reinterpret_cast<__half*>(ptr);
+    ptr += Br * DO_STRIDE * sizeof(__half);
 
     align(ptr);
-    __half* smemK0 = reinterpret_cast<__half*>(ptr); ptr += Bc * K_STRIDE * sizeof(__half);
+    __half* smemK0 = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * K_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemK1 = reinterpret_cast<__half*>(ptr); ptr += Bc * K_STRIDE * sizeof(__half);
+    __half* smemK1 = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * K_STRIDE * sizeof(__half);
     __half* smemK[2] = {smemK0, smemK1};
 
     align(ptr);
-    __half* smemV0 = reinterpret_cast<__half*>(ptr); ptr += Bc * V_STRIDE * sizeof(__half);
+    __half* smemV0 = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * V_STRIDE * sizeof(__half);
     align(ptr);
-    __half* smemV1 = reinterpret_cast<__half*>(ptr); ptr += Bc * V_STRIDE * sizeof(__half);
+    __half* smemV1 = reinterpret_cast<__half*>(ptr);
+    ptr += Bc * V_STRIDE * sizeof(__half);
     __half* smemV[2] = {smemV0, smemV1};
 
     align(ptr);
-    float* dQacc = reinterpret_cast<float*>(ptr); ptr += Br * Q_STRIDE * sizeof(float);
+    float* WorkSmem = reinterpret_cast<float*>(ptr);
+    ptr += Br * S_STRIDE * sizeof(float);
+    align(ptr);
+    __half* P_dS_smem = reinterpret_cast<__half*>(ptr);
+    ptr += Br * Bc * sizeof(__half);
 
     align(ptr);
-    float* WorkSmem = reinterpret_cast<float*>(ptr); ptr += Br * S_STRIDE * sizeof(float);
+    float* Lsmem = reinterpret_cast<float*>(ptr);
+    ptr += Br * sizeof(float);
     align(ptr);
-    __half* P_dS_smem = reinterpret_cast<__half*>(ptr); ptr += Br * Bc * sizeof(__half);
+    float* Deltasmem = reinterpret_cast<float*>(ptr);
 
-    align(ptr);
-    float* Lsmem = reinterpret_cast<float*>(ptr); ptr += Br * sizeof(float);
-    align(ptr);
-    float* Deltasmem = reinterpret_cast<float*>(ptr); ptr += Br * sizeof(float);
+    constexpr int OUT_TILES = (Br / 16) * (D / 8);
+    constexpr int TILES_PER_WARP = (OUT_TILES + 3) / 4;
+    constexpr int ACC_COUNT = TILES_PER_WARP * 4;
+
+    float dQ_frag[ACC_COUNT] = {0.0f};
 
     const int batchid = blockIdx.x;
-    const int headid  = blockIdx.y;
-    const int qid     = blockIdx.z;
+    const int headid = blockIdx.y;
+    const int qid = blockIdx.z;
     const int H_runtime = gridDim.y;
 
-    const long long base = ((long long)batchid * H_runtime + headid) * N * D;
-    const long long statbase = ((long long)batchid * H_runtime + headid) * N;
+    const long long base =
+        (static_cast<long long>(batchid) * H_runtime + headid) * N * D;
+    const long long statbase =
+        (static_cast<long long>(batchid) * H_runtime + headid) * N;
 
-    const __half* Qptr  = Q  + base;
-    const __half* Kptr  = K  + base;
-    const __half* Vptr  = V  + base;
+    const __half* Qptr = Q + base;
+    const __half* Kptr = K + base;
+    const __half* Vptr = V + base;
     const __half* DOptr = DO + base;
-    const float* Lptr     = L     + statbase;
+    const float* Lptr = L + statbase;
     const float* Deltaptr = delta + statbase;
     __half* DQptr = DQ + base;
 
@@ -567,88 +649,114 @@ __global__ void flashattn_bwd_dq_kernel(
 
     if (qid >= Tr) return;
 
-    for (int i = tid; i < Br * Q_STRIDE; i += blockDim.x) dQacc[i] = 0.0f;
-
-    asyncLOAD_2D_TILE<Br, D, 128>(Qptr, smem_u32_ptr(smemQ), tid, Q_STRIDE, N, D, D, qid, 0);
-    asyncLOAD_2D_TILE<Br, D, 128>(DOptr, smem_u32_ptr(smemdO), tid, DO_STRIDE, N, D, D, qid, 0);
+    asyncLOAD_2D_TILE<Br, D, 128>(
+        Qptr, smem_u32_ptr(smemQ), tid, Q_STRIDE,
+        N, D, D, qid, 0
+    );
+    asyncLOAD_2D_TILE<Br, D, 128>(
+        DOptr, smem_u32_ptr(smemdO), tid, DO_STRIDE,
+        N, D, D, qid, 0
+    );
     asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-    __syncthreads();
 
     for (int r = tid; r < Br; r += blockDim.x) {
-        int global_q = qid * Br + r;
+        const int global_q = qid * Br + r;
         if (global_q < N) {
-            Lsmem[r]     = Lptr[global_q];
+            Lsmem[r] = Lptr[global_q];
             Deltasmem[r] = Deltaptr[global_q];
         } else {
-            Lsmem[r]     = 0.0f;
+            Lsmem[r] = 0.0f;
             Deltasmem[r] = 0.0f;
         }
     }
-    __syncthreads();
 
-    asyncLOAD_2D_TILE<Bc, D, 128>(Kptr, smem_u32_ptr(smemK[0]), tid, K_STRIDE, N, D, D, 0, 0);
-    asyncLOAD_2D_TILE<Bc, D, 128>(Vptr, smem_u32_ptr(smemV[0]), tid, V_STRIDE, N, D, D, 0, 0);
+    asyncLOAD_2D_TILE<Bc, D, 128>(
+        Kptr, smem_u32_ptr(smemK[0]), tid, K_STRIDE,
+        N, D, D, 0, 0
+    );
+    asyncLOAD_2D_TILE<Bc, D, 128>(
+        Vptr, smem_u32_ptr(smemV[0]), tid, V_STRIDE,
+        N, D, D, 0, 0
+    );
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
-    for (int kvid = 0; kvid < Tc; kvid++) {
-        int curstage = kvid & 1;
-        int nextstage = curstage ^ 1;
-        int next_k = kvid + 1;
+    for (int ktile = 0; ktile < Tc; ++ktile) {
+        const int current_stage = ktile & 1;
+        const int next_stage = current_stage ^ 1;
+        const int next_ktile = ktile + 1;
 
-        if (next_k < Tc) {
-            asyncLOAD_2D_TILE<Bc, D, 128>(Kptr, smem_u32_ptr(smemK[nextstage]), tid, K_STRIDE, N, D, D, next_k, 0);
-            asyncLOAD_2D_TILE<Bc, D, 128>(Vptr, smem_u32_ptr(smemV[nextstage]), tid, V_STRIDE, N, D, D, next_k, 0);
+        if (next_ktile < Tc) {
+            asyncLOAD_2D_TILE<Bc, D, 128>(
+                Kptr, smem_u32_ptr(smemK[next_stage]), tid, K_STRIDE,
+                N, D, D, next_ktile, 0
+            );
+            asyncLOAD_2D_TILE<Bc, D, 128>(
+                Vptr, smem_u32_ptr(smemV[next_stage]), tid, V_STRIDE,
+                N, D, D, next_ktile, 0
+            );
             asm volatile("cp.async.commit_group;\n");
         }
 
-        mma_score_strided(smemQ, smemK[curstage], WorkSmem, Br, D, Bc, Q_STRIDE, K_STRIDE, S_STRIDE);
+        mma_score_f16_tiled<
+            Br, D, Bc, Q_STRIDE, K_STRIDE, S_STRIDE
+        >(smemQ, smemK[current_stage], WorkSmem);
         __syncthreads();
 
         for (int idx = tid; idx < Br * Bc; idx += blockDim.x) {
-            int r = idx / Bc; int c = idx % Bc;
-            int global_q = qid * Br + r; int global_k = kvid * Bc + c;
+            const int r = idx / Bc;
+            const int c = idx % Bc;
+            const int global_q = qid * Br + r;
+            const int global_k = ktile * Bc + c;
+
             float p = 0.0f;
             if (global_q < N && global_k < N) {
-                float score = WorkSmem[r * S_STRIDE + c];
-                p = __expf(score * SCALE - Lsmem[r]);
+                p = __expf(
+                    WorkSmem[r * S_STRIDE + c] * SCALE - Lsmem[r]
+                );
             }
             P_dS_smem[r * Bc + c] = __float2half(p);
         }
         __syncthreads();
 
-        mma_score_strided(smemdO, smemV[curstage], WorkSmem, Br, D, Bc, DO_STRIDE, V_STRIDE, S_STRIDE);
+        mma_score_f16_tiled<
+            Br, D, Bc, DO_STRIDE, V_STRIDE, S_STRIDE
+        >(smemdO, smemV[current_stage], WorkSmem);
         __syncthreads();
 
         for (int idx = tid; idx < Br * Bc; idx += blockDim.x) {
-            int r = idx / Bc; int c = idx % Bc;
-            int global_q = qid * Br + r; int global_k = kvid * Bc + c;
+            const int r = idx / Bc;
+            const int c = idx % Bc;
+            const int global_q = qid * Br + r;
+            const int global_k = ktile * Bc + c;
+
             float ds = 0.0f;
             if (global_q < N && global_k < N) {
-                float p  = __half2float(P_dS_smem[r * Bc + c]);
-                float dp = WorkSmem[r * S_STRIDE + c];
+                const float p =
+                    __half2float(P_dS_smem[r * Bc + c]);
+                const float dp = WorkSmem[r * S_STRIDE + c];
                 ds = p * (dp - Deltasmem[r]) * SCALE;
             }
             P_dS_smem[r * Bc + c] = __float2half(ds);
         }
         __syncthreads();
 
-        mma_accum_f16p_f16v_smem(P_dS_smem, smemK[curstage], dQacc, Br, Bc, D, Bc, K_STRIDE, Q_STRIDE);
-        __syncthreads();
+        mma_accum_f16_registers<
+            Br, Bc, D, Bc, K_STRIDE, ACC_COUNT
+        >(
+            P_dS_smem,
+            smemK[current_stage],
+            dQ_frag
+        );
 
-        if (next_k < Tc) {
+        if (next_ktile < Tc) {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             __syncthreads();
         }
     }
 
-    for (int i = tid; i < Br * D; i += blockDim.x) {
-        int r = i / D; int c = i % D;
-        int global_r = qid * Br + r;
-        if (global_r < N && c < D) {
-            DQptr[(size_t)global_r * D + c] = __float2half(dQacc[r * Q_STRIDE + c]);
-        }
-    }
+    store_f16_registers<Br, D, ACC_COUNT>(
+        dQ_frag, DQptr, qid * Br, N, D
+    );
 }

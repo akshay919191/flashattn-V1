@@ -15,10 +15,6 @@
 
 
 
-
-// ----------------------------------------------------------------------------
-// FORWARD IMPLEMENTATION
-// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 std::vector<torch::Tensor> flash_fwd_impl(
     torch::Tensor Q,
@@ -111,9 +107,6 @@ std::vector<torch::Tensor> flash_fwd(
     TORCH_CHECK(false, "Unsupported D. Supported D: 32, 64, 128, 256");
 }
 
-// ----------------------------------------------------------------------------
-// BACKWARD IMPLEMENTATION
-// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 std::vector<torch::Tensor> flash_bwd_impl(
     torch::Tensor Q,
@@ -140,7 +133,9 @@ std::vector<torch::Tensor> flash_bwd_impl(
     dim3 block(128);
 
     int total_rows = B * H * N;
-    int delta_blocks = (total_rows + block.x - 1) / block.x; 
+    int rows_per_delta_block = block.x / 32;
+    int delta_blocks =
+        (total_rows + rows_per_delta_block - 1) / rows_per_delta_block;
 
     calc_delta_kernel<D>
         <<<delta_blocks, block.x, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -164,8 +159,6 @@ std::vector<torch::Tensor> flash_bwd_impl(
     bwd_dkdv_smem_size += 2 * Br * DO_STRIDE * sizeof(__half);
     bwd_dkdv_smem_size += Bc * K_STRIDE  * sizeof(__half);
     bwd_dkdv_smem_size += Bc * V_STRIDE  * sizeof(__half);
-    bwd_dkdv_smem_size += Bc * K_STRIDE  * sizeof(float);
-    bwd_dkdv_smem_size += Bc * V_STRIDE  * sizeof(float);
     bwd_dkdv_smem_size += Br * S_STRIDE  * sizeof(float);
     bwd_dkdv_smem_size += Bc * Br * sizeof(__half);
     bwd_dkdv_smem_size += 2 * Br * sizeof(float);
@@ -203,7 +196,6 @@ std::vector<torch::Tensor> flash_bwd_impl(
     bwd_dq_smem_size += Br * DO_STRIDE * sizeof(__half);
     bwd_dq_smem_size += 2 * Bc * K_STRIDE  * sizeof(__half);
     bwd_dq_smem_size += 2 * Bc * V_STRIDE  * sizeof(__half);
-    bwd_dq_smem_size += Br * Q_STRIDE  * sizeof(float);
     bwd_dq_smem_size += Br * S_STRIDE  * sizeof(float);
     bwd_dq_smem_size += Br * Bc * sizeof(__half);
     bwd_dq_smem_size += 2 * Br * sizeof(float);
@@ -285,8 +277,8 @@ std::vector<torch::Tensor> flash_bwd(
 
     TORCH_CHECK(N_runtime > 0, "N must be > 0");
 
-    if (D_runtime == 32)  return flash_bwd_impl<16, 32, 32>(Q, K, V, O, dO, L);
-    if (D_runtime == 64)  return flash_bwd_impl<16, 16, 64>(Q, K, V, O, dO, L);
+    if (D_runtime == 32)  return flash_bwd_impl<32, 32, 32>(Q, K, V, O, dO, L);
+    if (D_runtime == 64)  return flash_bwd_impl<32, 32, 64>(Q, K, V, O, dO, L);
     if (D_runtime == 128) return flash_bwd_impl<16, 32, 128>(Q, K, V, O, dO, L);
     if (D_runtime == 256) return flash_bwd_impl<16, 16, 256>(Q, K, V, O, dO, L);
 
