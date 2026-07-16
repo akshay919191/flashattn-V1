@@ -12,8 +12,8 @@ torch.manual_seed(0)
 
 B = 1
 H = 8
-N = 512
-D = 128
+N = 4096
+D = 64
 
 Q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16).contiguous()
 K = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16).contiguous()
@@ -60,3 +60,25 @@ print("same row mean err:", row_err.mean().item())
 bad = (O_err > 0.05).nonzero()
 print("bad count >0.05:", bad.shape[0])
 print("first bad:", bad[:20])
+
+Q0 = torch.zeros_like(Q)
+K0 = torch.zeros_like(K)
+V0 = torch.randn_like(V)
+
+O0, L0 = flash_acc_reg_ext.flash_fwd(Q0, K0, V0)
+torch.cuda.synchronize()
+
+L0_ref = torch.full_like(L0, math.log(N))
+O0_ref = V0.float().mean(dim=2, keepdim=True).expand_as(O0)
+
+print("UNIFORM L max:", (L0 - L0_ref).abs().max().item())
+print("UNIFORM L mean:", (L0 - L0_ref).abs().mean().item())
+print("UNIFORM O max:", (O0.float() - O0_ref).abs().max().item())
+print("UNIFORM O mean:", (O0.float() - O0_ref).abs().mean().item())
+
+O2, L2 = flash_acc_reg_ext.flash_fwd(Q, K, V)
+torch.cuda.synchronize()
+
+print("repeat O diff:", (O.float() - O2.float()).abs().max().item())
+print("repeat L diff:", (L - L2).abs().max().item())
+print("signed L error:", (L - L_ref).mean().item())

@@ -13,6 +13,12 @@
 #include "helper.cuh"
 #include "flash_Acc_reg.cuh"
 
+
+
+
+// ----------------------------------------------------------------------------
+// FORWARD IMPLEMENTATION
+// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 std::vector<torch::Tensor> flash_fwd_impl(
     torch::Tensor Q,
@@ -34,20 +40,12 @@ std::vector<torch::Tensor> flash_fwd_impl(
     constexpr int Q_STRIDE = D + PAD;
     constexpr int K_STRIDE = D + PAD;
     constexpr int V_STRIDE = D + PAD;
-    constexpr int S_STRIDE = Bc;
 
-    size_t smem_size =
-        Br * Q_STRIDE * sizeof(__half) +
-        Bc * K_STRIDE * sizeof(__half) +
-        Bc * K_STRIDE * sizeof(__half) +
-        Bc * V_STRIDE * sizeof(__half) +
-        Bc * V_STRIDE * sizeof(__half) +
-        Br * S_STRIDE * sizeof(float) +
-        Br * Bc * sizeof(__half) +
-        Br * sizeof(float) +
-        Br * sizeof(float) +
-        Br * sizeof(float) +
-        1024;
+    size_t smem_size = 0;
+    smem_size += Br * Q_STRIDE * sizeof(__half);
+    smem_size += 2 * Bc * K_STRIDE * sizeof(__half);
+    smem_size += 2 * Bc * V_STRIDE * sizeof(__half);
+    smem_size += 256;
 
     dim3 block(128);
     dim3 grid(B, H, (N + Br - 1) / Br);
@@ -70,7 +68,6 @@ std::vector<torch::Tensor> flash_fwd_impl(
         );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
     return {O, L};
 }
 
@@ -101,32 +98,22 @@ std::vector<torch::Tensor> flash_fwd(
     int N_runtime = Q.size(2);
     int D_runtime = Q.size(3);
 
-    TORCH_CHECK(K.size(0) == B && K.size(1) == H && K.size(2) == N_runtime && K.size(3) == D_runtime,
-                "K shape must match Q");
-    TORCH_CHECK(V.size(0) == B && V.size(1) == H && V.size(2) == N_runtime && V.size(3) == D_runtime,
-                "V shape must match Q");
+    TORCH_CHECK(K.size(0) == B && K.size(1) == H && K.size(2) == N_runtime && K.size(3) == D_runtime, "K shape must match Q");
+    TORCH_CHECK(V.size(0) == B && V.size(1) == H && V.size(2) == N_runtime && V.size(3) == D_runtime, "V shape must match Q");
 
     TORCH_CHECK(N_runtime > 0, "N must be > 0");
 
-    if (D_runtime == 32) {
-        return flash_fwd_impl<16, 32, 32>(Q, K, V);
-    }
-
-    if (D_runtime == 64) {
-        return flash_fwd_impl<16, 32, 64>(Q, K, V);
-    }
-
-    if (D_runtime == 128) {
-        return flash_fwd_impl<16, 32, 128>(Q, K, V);
-    }
-
-    if (D_runtime == 256) {
-        return flash_fwd_impl<16, 16, 256>(Q, K, V);
-    }
+    if (D_runtime == 32)  return flash_fwd_impl<64, 64, 32>(Q, K, V);
+    if (D_runtime == 64)  return flash_fwd_impl<64, 64, 64>(Q, K, V);
+    if (D_runtime == 128) return flash_fwd_impl<64, 64, 128>(Q, K, V);
+    if (D_runtime == 256) return flash_fwd_impl<64, 32, 256>(Q, K, V);
 
     TORCH_CHECK(false, "Unsupported D. Supported D: 32, 64, 128, 256");
 }
 
+// ----------------------------------------------------------------------------
+// BACKWARD IMPLEMENTATION
+// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 std::vector<torch::Tensor> flash_bwd_impl(
     torch::Tensor Q,
@@ -153,10 +140,10 @@ std::vector<torch::Tensor> flash_bwd_impl(
     dim3 block(128);
 
     int total_rows = B * H * N;
-    int delta_blocks = (total_rows + 3) / 4;
+    int delta_blocks = (total_rows + block.x - 1) / block.x; 
 
     calc_delta_kernel<D>
-        <<<delta_blocks, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        <<<delta_blocks, block.x, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __half*>(O.data_ptr<at::Half>()),
             reinterpret_cast<const __half*>(dO.data_ptr<at::Half>()),
             Delta.data_ptr<float>(),
@@ -166,27 +153,23 @@ std::vector<torch::Tensor> flash_bwd_impl(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     constexpr int PAD = 8;
-
     constexpr int Q_STRIDE  = D + PAD;
     constexpr int K_STRIDE  = D + PAD;
     constexpr int V_STRIDE  = D + PAD;
     constexpr int DO_STRIDE = D + PAD;
+    constexpr int S_STRIDE  = Bc + PAD;
 
-    size_t bwd_smem_size =
-        Br * Q_STRIDE  * sizeof(__half) +
-        Bc * K_STRIDE  * sizeof(__half) +
-        Bc * V_STRIDE  * sizeof(__half) +
-        Br * DO_STRIDE * sizeof(__half) +
-
-        Br * Bc * sizeof(float) +
-        Br * sizeof(float) +
-        Br * sizeof(float) +
-
-        Br * Bc * sizeof(__half) +
-        Br * Bc * sizeof(float) +
-        Br * Bc * sizeof(__half) +
-
-        1024;
+    size_t bwd_dkdv_smem_size = 0;
+    bwd_dkdv_smem_size += 2 * Br * Q_STRIDE  * sizeof(__half);
+    bwd_dkdv_smem_size += 2 * Br * DO_STRIDE * sizeof(__half);
+    bwd_dkdv_smem_size += Bc * K_STRIDE  * sizeof(__half);
+    bwd_dkdv_smem_size += Bc * V_STRIDE  * sizeof(__half);
+    bwd_dkdv_smem_size += Bc * K_STRIDE  * sizeof(float);
+    bwd_dkdv_smem_size += Bc * V_STRIDE  * sizeof(float);
+    bwd_dkdv_smem_size += Br * S_STRIDE  * sizeof(float);
+    bwd_dkdv_smem_size += Bc * Br * sizeof(__half);
+    bwd_dkdv_smem_size += 2 * Br * sizeof(float);
+    bwd_dkdv_smem_size += 256;
 
     int Tr = (N + Br - 1) / Br;
     int Tc = (N + Bc - 1) / Bc;
@@ -196,12 +179,12 @@ std::vector<torch::Tensor> flash_bwd_impl(
     cudaFuncSetAttribute(
         flashattn_bwd_dkdv_kernel<Br, Bc, D>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)bwd_smem_size
+        (int)bwd_dkdv_smem_size
     );
     C10_CUDA_CHECK(cudaGetLastError());
 
     flashattn_bwd_dkdv_kernel<Br, Bc, D>
-        <<<dkdv_grid, block, bwd_smem_size, at::cuda::getCurrentCUDAStream()>>>(
+        <<<dkdv_grid, block, bwd_dkdv_smem_size, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __half*>(Q.data_ptr<at::Half>()),
             reinterpret_cast<const __half*>(K.data_ptr<at::Half>()),
             reinterpret_cast<const __half*>(V.data_ptr<at::Half>()),
@@ -215,17 +198,28 @@ std::vector<torch::Tensor> flash_bwd_impl(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    size_t bwd_dq_smem_size = 0;
+    bwd_dq_smem_size += Br * Q_STRIDE  * sizeof(__half);
+    bwd_dq_smem_size += Br * DO_STRIDE * sizeof(__half);
+    bwd_dq_smem_size += 2 * Bc * K_STRIDE  * sizeof(__half);
+    bwd_dq_smem_size += 2 * Bc * V_STRIDE  * sizeof(__half);
+    bwd_dq_smem_size += Br * Q_STRIDE  * sizeof(float);
+    bwd_dq_smem_size += Br * S_STRIDE  * sizeof(float);
+    bwd_dq_smem_size += Br * Bc * sizeof(__half);
+    bwd_dq_smem_size += 2 * Br * sizeof(float);
+    bwd_dq_smem_size += 256;
+
     dim3 dq_grid(B, H, Tr);
 
     cudaFuncSetAttribute(
         flashattn_bwd_dq_kernel<Br, Bc, D>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)bwd_smem_size
+        (int)bwd_dq_smem_size
     );
     C10_CUDA_CHECK(cudaGetLastError());
 
     flashattn_bwd_dq_kernel<Br, Bc, D>
-        <<<dq_grid, block, bwd_smem_size, at::cuda::getCurrentCUDAStream()>>>(
+        <<<dq_grid, block, bwd_dq_smem_size, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __half*>(Q.data_ptr<at::Half>()),
             reinterpret_cast<const __half*>(K.data_ptr<at::Half>()),
             reinterpret_cast<const __half*>(V.data_ptr<at::Half>()),
@@ -283,34 +277,18 @@ std::vector<torch::Tensor> flash_bwd(
     int N_runtime = Q.size(2);
     int D_runtime = Q.size(3);
 
-    TORCH_CHECK(K.size(0) == B && K.size(1) == H && K.size(2) == N_runtime && K.size(3) == D_runtime,
-                "K shape must match Q");
-    TORCH_CHECK(V.size(0) == B && V.size(1) == H && V.size(2) == N_runtime && V.size(3) == D_runtime,
-                "V shape must match Q");
-    TORCH_CHECK(O.size(0) == B && O.size(1) == H && O.size(2) == N_runtime && O.size(3) == D_runtime,
-                "O shape must match Q");
-    TORCH_CHECK(dO.size(0) == B && dO.size(1) == H && dO.size(2) == N_runtime && dO.size(3) == D_runtime,
-                "dO shape must match Q");
-    TORCH_CHECK(L.size(0) == B && L.size(1) == H && L.size(2) == N_runtime,
-                "L shape must be [B,H,N]");
+    TORCH_CHECK(K.size(0) == B && K.size(1) == H && K.size(2) == N_runtime && K.size(3) == D_runtime, "K shape must match Q");
+    TORCH_CHECK(V.size(0) == B && V.size(1) == H && V.size(2) == N_runtime && V.size(3) == D_runtime, "V shape must match Q");
+    TORCH_CHECK(O.size(0) == B && O.size(1) == H && O.size(2) == N_runtime && O.size(3) == D_runtime, "O shape must match Q");
+    TORCH_CHECK(dO.size(0) == B && dO.size(1) == H && dO.size(2) == N_runtime && dO.size(3) == D_runtime, "dO shape must match Q");
+    TORCH_CHECK(L.size(0) == B && L.size(1) == H && L.size(2) == N_runtime, "L shape must be [B,H,N]");
 
     TORCH_CHECK(N_runtime > 0, "N must be > 0");
 
-    if (D_runtime == 32) {
-        return flash_bwd_impl<16, 32, 32>(Q, K, V, O, dO, L);
-    }
-
-    if (D_runtime == 64) {
-        return flash_bwd_impl<16, 32, 64>(Q, K, V, O, dO, L);
-    }
-
-    if (D_runtime == 128) {
-        return flash_bwd_impl<16, 32, 128>(Q, K, V, O, dO, L);
-    }
-
-    if (D_runtime == 256) {
-        return flash_bwd_impl<16, 16, 256>(Q, K, V, O, dO, L);
-    }
+    if (D_runtime == 32)  return flash_bwd_impl<16, 32, 32>(Q, K, V, O, dO, L);
+    if (D_runtime == 64)  return flash_bwd_impl<16, 16, 64>(Q, K, V, O, dO, L);
+    if (D_runtime == 128) return flash_bwd_impl<16, 32, 128>(Q, K, V, O, dO, L);
+    if (D_runtime == 256) return flash_bwd_impl<16, 16, 256>(Q, K, V, O, dO, L);
 
     TORCH_CHECK(false, "Unsupported D. Supported D: 32, 64, 128, 256");
 }
