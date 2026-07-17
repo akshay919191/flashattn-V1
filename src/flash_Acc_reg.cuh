@@ -542,9 +542,6 @@ __global__ void flashattn_bwd_dkdv_kernel(
     );
 }
 
-// ----------------------------------------------------------------------------
-// Backward dQ kernel
-// ----------------------------------------------------------------------------
 template<int Br, int Bc, int D>
 __global__ void flashattn_bwd_dq_kernel(
     const __half* __restrict__ Q,
