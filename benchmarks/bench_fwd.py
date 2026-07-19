@@ -14,7 +14,7 @@ torch.manual_seed(0)
 B = 1
 H = 8
 N = 4096
-D = 64
+D = 182
 
 warmup = 2
 iters = 5
