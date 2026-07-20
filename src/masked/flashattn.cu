@@ -211,244 +211,6 @@ __device__ __forceinline__ uint32_t pack_half2_u32(__half x, __half y) {
 }
 
 
-template<int Br, int D, int O_STRIDE>
-__device__ __forceinline__ void oaccSCALING_smem(
-    float* __restrict__ Osmem,
-    const float* __restrict__ Alphasmem
-) {
-    int tid = threadIdx.x;
-    for (int i = tid; i < Br * D; i += blockDim.x) {
-        int row = i / D;
-        int col = i % D;
-        Osmem[row * O_STRIDE + col] *= Alphasmem[row];
-    }
-}
-
-__device__ __forceinline__ void mma_pv_accum_f32p_f16v(
-    const float*  __restrict__ P,
-    const __half* __restrict__ V,
-    float*        __restrict__ Oacc,
-    int M, int K, int N,
-    int P_STRIDE, int V_STRIDE, int O_STRIDE
-) {
-    int tid  = threadIdx.x;
-    int warp = tid >> 5;
-    int lane = tid & 31;
-    int warps_per_block = blockDim.x >> 5;
-    int group = lane >> 2;
-    int tid4  = lane & 3;
-
-    constexpr int MMA_M = 16;
-    constexpr int MMA_N = 8;
-    constexpr int MMA_K = 16;
-
-    int num_m_tiles = (M + 15) / 16;
-    int num_n_tiles = (N + 7)  / 8;
-    int num_k_tiles = (K + 15) / 16;
-    int total_tiles = num_m_tiles * num_n_tiles;
-
-    for (int tile_idx = warp; tile_idx < total_tiles; tile_idx += warps_per_block) {
-        int mt = tile_idx / num_n_tiles;
-        int nt = tile_idx % num_n_tiles;
-        int row_start = mt * MMA_M;
-        int col_start = nt * MMA_N;
-
-        int c_row0 = row_start + group;
-        int c_row1 = row_start + group + 8;
-        int c_col0 = col_start + tid4 * 2;
-        int c_col1 = c_col0 + 1;
-
-        float acc[4];
-        acc[0] = (c_row0 < M && c_col0 < N) ? Oacc[c_row0 * O_STRIDE + c_col0] : 0.f;
-        acc[1] = (c_row0 < M && c_col1 < N) ? Oacc[c_row0 * O_STRIDE + c_col1] : 0.f;
-        acc[2] = (c_row1 < M && c_col0 < N) ? Oacc[c_row1 * O_STRIDE + c_col0] : 0.f;
-        acc[3] = (c_row1 < M && c_col1 < N) ? Oacc[c_row1 * O_STRIDE + c_col1] : 0.f;
-
-        for (int kt = 0; kt < num_k_tiles; kt++) {
-            int k_start = kt * MMA_K;
-            int k0 = k_start + tid4 * 2;
-
-            uint32_t a_frag[4];
-            uint32_t b_frag[2];
-
-            int a_row0 = row_start + group;
-            int a_row1 = row_start + group + 8;
-
-            float p00 = (a_row0 < M && k0 < K)     ? P[a_row0 * P_STRIDE + k0]     : 0.f;
-            float p01 = (a_row0 < M && k0 + 1 < K) ? P[a_row0 * P_STRIDE + k0 + 1] : 0.f;
-            float p10 = (a_row1 < M && k0 < K)     ? P[a_row1 * P_STRIDE + k0]     : 0.f;
-            float p11 = (a_row1 < M && k0 + 1 < K) ? P[a_row1 * P_STRIDE + k0 + 1] : 0.f;
-            float p02 = (a_row0 < M && k0 + 8 < K) ? P[a_row0 * P_STRIDE + k0 + 8] : 0.f;
-            float p03 = (a_row0 < M && k0 + 9 < K) ? P[a_row0 * P_STRIDE + k0 + 9] : 0.f;
-            float p12 = (a_row1 < M && k0 + 8 < K) ? P[a_row1 * P_STRIDE + k0 + 8] : 0.f;
-            float p13 = (a_row1 < M && k0 + 9 < K) ? P[a_row1 * P_STRIDE + k0 + 9] : 0.f;
-
-            a_frag[0] = pack_float2_to_half2_u32(p00, p01);
-            a_frag[1] = pack_float2_to_half2_u32(p10, p11);
-            a_frag[2] = pack_float2_to_half2_u32(p02, p03);
-            a_frag[3] = pack_float2_to_half2_u32(p12, p13);
-
-            int out_col = col_start + group;
-
-            __half v00 = (k0 < K && out_col < N) ? V[k0 * V_STRIDE + out_col] : __float2half(0.f);
-            __half v01 = (k0 + 1 < K && out_col < N) ? V[(k0 + 1) * V_STRIDE + out_col] : __float2half(0.f);
-            __half v10 = (k0 + 8 < K && out_col < N) ? V[(k0 + 8) * V_STRIDE + out_col] : __float2half(0.f);
-            __half v11 = (k0 + 9 < K && out_col < N) ? V[(k0 + 9) * V_STRIDE + out_col] : __float2half(0.f);
-
-            b_frag[0] = pack_half2_u32(v00, v01);
-            b_frag[1] = pack_half2_u32(v10, v11);
-
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
-                  "r"(b_frag[0]), "r"(b_frag[1])
-            );
-        }
-
-        if (c_row0 < M && c_col0 < N) Oacc[c_row0 * O_STRIDE + c_col0] = acc[0];
-        if (c_row0 < M && c_col1 < N) Oacc[c_row0 * O_STRIDE + c_col1] = acc[1];
-        if (c_row1 < M && c_col0 < N) Oacc[c_row1 * O_STRIDE + c_col0] = acc[2];
-        if (c_row1 < M && c_col1 < N) Oacc[c_row1 * O_STRIDE + c_col1] = acc[3];
-    }
-}
-
-__device__ __forceinline__ void mma_accum_f16p_f16v_smem(
-    const __half* __restrict__ A,
-    const __half* __restrict__ B,
-    float*        __restrict__ C,
-    int M,
-    int K,
-    int N,
-    int A_stride,
-    int B_stride,
-    int C_stride
-) {
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int warps_per_block = blockDim.x >> 5;
-    const int group = lane >> 2;
-    const int lane4 = lane & 3;
-
-    const int num_m_tiles = (M + 15) / 16;
-    const int num_n_tiles = (N + 7) / 8;
-    const int num_k_tiles = (K + 15) / 16;
-    const int total_tiles = num_m_tiles * num_n_tiles;
-
-    for (int tile = warp; tile < total_tiles; tile += warps_per_block) {
-        const int m_tile = tile / num_n_tiles;
-        const int n_tile = tile % num_n_tiles;
-        const int row_start = m_tile * 16;
-        const int col_start = n_tile * 8;
-
-        const int out_row0 = row_start + group;
-        const int out_row1 = out_row0 + 8;
-        const int out_col0 = col_start + lane4 * 2;
-        const int out_col1 = out_col0 + 1;
-
-        float acc[4];
-        acc[0] = (out_row0 < M && out_col0 < N)
-            ? C[out_row0 * C_stride + out_col0]
-            : 0.0f;
-        acc[1] = (out_row0 < M && out_col1 < N)
-            ? C[out_row0 * C_stride + out_col1]
-            : 0.0f;
-        acc[2] = (out_row1 < M && out_col0 < N)
-            ? C[out_row1 * C_stride + out_col0]
-            : 0.0f;
-        acc[3] = (out_row1 < M && out_col1 < N)
-            ? C[out_row1 * C_stride + out_col1]
-            : 0.0f;
-
-        for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-            const int k0 = k_tile * 16 + lane4 * 2;
-
-            const int a_row0 = row_start + group;
-            const int a_row1 = a_row0 + 8;
-            const int b_col = col_start + group;
-
-            const __half zero = __float2half(0.0f);
-
-            const __half a00 = (a_row0 < M && k0 < K)
-                ? A[a_row0 * A_stride + k0]
-                : zero;
-            const __half a01 = (a_row0 < M && k0 + 1 < K)
-                ? A[a_row0 * A_stride + k0 + 1]
-                : zero;
-            const __half a10 = (a_row1 < M && k0 < K)
-                ? A[a_row1 * A_stride + k0]
-                : zero;
-            const __half a11 = (a_row1 < M && k0 + 1 < K)
-                ? A[a_row1 * A_stride + k0 + 1]
-                : zero;
-            const __half a20 = (a_row0 < M && k0 + 8 < K)
-                ? A[a_row0 * A_stride + k0 + 8]
-                : zero;
-            const __half a21 = (a_row0 < M && k0 + 9 < K)
-                ? A[a_row0 * A_stride + k0 + 9]
-                : zero;
-            const __half a30 = (a_row1 < M && k0 + 8 < K)
-                ? A[a_row1 * A_stride + k0 + 8]
-                : zero;
-            const __half a31 = (a_row1 < M && k0 + 9 < K)
-                ? A[a_row1 * A_stride + k0 + 9]
-                : zero;
-
-            uint32_t a_frag[4];
-            a_frag[0] = pack_half2_u32(a00, a01);
-            a_frag[1] = pack_half2_u32(a10, a11);
-            a_frag[2] = pack_half2_u32(a20, a21);
-            a_frag[3] = pack_half2_u32(a30, a31);
-
-
-
-            const __half b00 = (k0 < K && b_col < N)
-                ? B[k0 * B_stride + b_col]
-                : zero;
-            const __half b01 = (k0 + 1 < K && b_col < N)
-                ? B[(k0 + 1) * B_stride + b_col]
-                : zero;
-            const __half b10 = (k0 + 8 < K && b_col < N)
-                ? B[(k0 + 8) * B_stride + b_col]
-                : zero;
-            const __half b11 = (k0 + 9 < K && b_col < N)
-                ? B[(k0 + 9) * B_stride + b_col]
-                : zero;
-
-            uint32_t b_frag[2];
-            b_frag[0] = pack_half2_u32(b00, b01);
-            b_frag[1] = pack_half2_u32(b10, b11);
-
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0, %1, %2, %3}, "
-                "{%4, %5, %6, %7}, "
-                "{%8, %9}, "
-                "{%0, %1, %2, %3};\n"
-                : "+f"(acc[0]), "+f"(acc[1]),
-                  "+f"(acc[2]), "+f"(acc[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]),
-                  "r"(a_frag[2]), "r"(a_frag[3]),
-                  "r"(b_frag[0]), "r"(b_frag[1])
-            );
-        }
-
-        if (out_row0 < M && out_col0 < N) {
-            C[out_row0 * C_stride + out_col0] = acc[0];
-        }
-        if (out_row0 < M && out_col1 < N) {
-            C[out_row0 * C_stride + out_col1] = acc[1];
-        }
-        if (out_row1 < M && out_col0 < N) {
-            C[out_row1 * C_stride + out_col0] = acc[2];
-        }
-        if (out_row1 < M && out_col1 < N) {
-            C[out_row1 * C_stride + out_col1] = acc[3];
-        }
-    }
-}
 
 template<
     int M,
@@ -706,7 +468,6 @@ __device__ __forceinline__ void store_f16_registers(
 
 
 
-
 template<int Br, int Bc, int D_PAD, bool masked>
 __global__ void flashattn_fwd(
     const __half* __restrict__ Q,
@@ -900,23 +661,25 @@ __global__ void flashattn_fwd(
         float S_frag[Bk * 4] = {0.0f};
 
 
-        for (int kb = 0; kb < Bk; ++kb) {
-            for (int ks = 0; ks < Dk; ++ks) {
-                uint32_t q_frag[4];
-                const int q_row =
-                    warp * 16 + (lane & 15);
-                const int q_col =
-                    ks * 16 + ((lane < 16) ? 0 : 8);
+        const int q_row = warp * 16 + (lane & 15);
+        const int lane16 = lane & 15;
 
-                ldmatrix_x4(
-                    q_frag,
-                    smem_u32_ptr(
-                        Qsmem + q_row * Q_STRIDE + q_col
-                    )
-                );
+        #pragma unroll
+        for (int ks = 0; ks < Dk; ++ks) {
+            uint32_t q_frag[4];
+            const int q_col =
+                ks * 16 + ((lane < 16) ? 0 : 8);
 
+            ldmatrix_x4(
+                q_frag,
+                smem_u32_ptr(
+                    Qsmem + q_row * Q_STRIDE + q_col
+                )
+            );
+
+            #pragma unroll
+            for (int kb = 0; kb < Bk; ++kb) {
                 uint32_t k_frag[2];
-                const int lane16 = lane & 15;
                 const int k_row =
                     kb * 8 + (lane16 & 7);
                 const int k_col =
@@ -955,6 +718,9 @@ __global__ void flashattn_fwd(
                 ? kv_last_unclamped
                 : Skv - 1;
 
+        const bool q_tile_full = q_block_last_unclamped < Sq;
+        const bool kv_tile_full = kv_last_unclamped < Skv;
+
         bool needs_causal_mask = false;
         if constexpr (masked) {
             const bool fully_valid =
@@ -962,70 +728,116 @@ __global__ void flashattn_fwd(
             needs_causal_mask = !fully_valid;
         }
 
+        const bool needs_any_mask =
+            !q_tile_full || !kv_tile_full || needs_causal_mask;
+
         float tile_max[2] = {-FLT_MAX, -FLT_MAX};
 
+        if (!needs_any_mask) {
+            #pragma unroll
+            for (int kb = 0; kb < Bk; ++kb) {
+                const float s0 = S_frag[kb * 4 + 0] * scale;
+                const float s1 = S_frag[kb * 4 + 1] * scale;
+                const float s2 = S_frag[kb * 4 + 2] * scale;
+                const float s3 = S_frag[kb * 4 + 3] * scale;
 
-        const int query0 =
-            q_block_start + warp * 16 + lane / 4;
-        const int query1 = query0 + 8;
+                S_frag[kb * 4 + 0] = s0;
+                S_frag[kb * 4 + 1] = s1;
+                S_frag[kb * 4 + 2] = s2;
+                S_frag[kb * 4 + 3] = s3;
 
-        for (int kb = 0; kb < Bk; ++kb) {
-            const int key0 =
-                kv_start + kb * 8 + lane4 * 2;
-            const int key1 = key0 + 1;
+                float max0 = fmaxf(s0, s1);
+                float max1 = fmaxf(s2, s3);
 
-            float s0 = S_frag[kb * 4 + 0] * scale;
-            float s1 = S_frag[kb * 4 + 1] * scale;
-            float s2 = S_frag[kb * 4 + 2] * scale;
-            float s3 = S_frag[kb * 4 + 3] * scale;
+                max0 = fmaxf(
+                    max0,
+                    __shfl_xor_sync(0xffffffffu, max0, 1, 4)
+                );
+                max0 = fmaxf(
+                    max0,
+                    __shfl_xor_sync(0xffffffffu, max0, 2, 4)
+                );
 
-            bool valid00 = query0 < Sq && key0 < Skv;
-            bool valid01 = query0 < Sq && key1 < Skv;
-            bool valid10 = query1 < Sq && key0 < Skv;
-            bool valid11 = query1 < Sq && key1 < Skv;
+                max1 = fmaxf(
+                    max1,
+                    __shfl_xor_sync(0xffffffffu, max1, 1, 4)
+                );
+                max1 = fmaxf(
+                    max1,
+                    __shfl_xor_sync(0xffffffffu, max1, 2, 4)
+                );
 
-            if constexpr (masked) {
-                if (needs_causal_mask) {
-                    valid00 = valid00 && key0 <= query0;
-                    valid01 = valid01 && key1 <= query0;
-                    valid10 = valid10 && key0 <= query1;
-                    valid11 = valid11 && key1 <= query1;
-                }
+                tile_max[0] = fmaxf(tile_max[0], max0);
+                tile_max[1] = fmaxf(tile_max[1], max1);
             }
+        } else {
+            const int query0 =
+                q_block_start + warp * 16 + lane / 4;
+            const int query1 = query0 + 8;
+            const bool query0_in_bounds = query0 < Sq;
+            const bool query1_in_bounds = query1 < Sq;
 
-            if (!valid00) s0 = -FLT_MAX;
-            if (!valid01) s1 = -FLT_MAX;
-            if (!valid10) s2 = -FLT_MAX;
-            if (!valid11) s3 = -FLT_MAX;
+            #pragma unroll
+            for (int kb = 0; kb < Bk; ++kb) {
+                const int key0 =
+                    kv_start + kb * 8 + lane4 * 2;
+                const int key1 = key0 + 1;
+                const bool key0_in_bounds = key0 < Skv;
+                const bool key1_in_bounds = key1 < Skv;
 
-            S_frag[kb * 4 + 0] = s0;
-            S_frag[kb * 4 + 1] = s1;
-            S_frag[kb * 4 + 2] = s2;
-            S_frag[kb * 4 + 3] = s3;
+                float s0 = S_frag[kb * 4 + 0] * scale;
+                float s1 = S_frag[kb * 4 + 1] * scale;
+                float s2 = S_frag[kb * 4 + 2] * scale;
+                float s3 = S_frag[kb * 4 + 3] * scale;
 
-            float max0 = fmaxf(s0, s1);
-            float max1 = fmaxf(s2, s3);
+                bool valid00 = query0_in_bounds && key0_in_bounds;
+                bool valid01 = query0_in_bounds && key1_in_bounds;
+                bool valid10 = query1_in_bounds && key0_in_bounds;
+                bool valid11 = query1_in_bounds && key1_in_bounds;
 
-            max0 = fmaxf(
-                max0,
-                __shfl_xor_sync(0xffffffffu, max0, 1, 4)
-            );
-            max0 = fmaxf(
-                max0,
-                __shfl_xor_sync(0xffffffffu, max0, 2, 4)
-            );
+                if constexpr (masked) {
+                    if (needs_causal_mask) {
+                        valid00 = valid00 && key0 <= query0;
+                        valid01 = valid01 && key1 <= query0;
+                        valid10 = valid10 && key0 <= query1;
+                        valid11 = valid11 && key1 <= query1;
+                    }
+                }
 
-            max1 = fmaxf(
-                max1,
-                __shfl_xor_sync(0xffffffffu, max1, 1, 4)
-            );
-            max1 = fmaxf(
-                max1,
-                __shfl_xor_sync(0xffffffffu, max1, 2, 4)
-            );
+                if (!valid00) s0 = -FLT_MAX;
+                if (!valid01) s1 = -FLT_MAX;
+                if (!valid10) s2 = -FLT_MAX;
+                if (!valid11) s3 = -FLT_MAX;
 
-            tile_max[0] = fmaxf(tile_max[0], max0);
-            tile_max[1] = fmaxf(tile_max[1], max1);
+                S_frag[kb * 4 + 0] = s0;
+                S_frag[kb * 4 + 1] = s1;
+                S_frag[kb * 4 + 2] = s2;
+                S_frag[kb * 4 + 3] = s3;
+
+                float max0 = fmaxf(s0, s1);
+                float max1 = fmaxf(s2, s3);
+
+                max0 = fmaxf(
+                    max0,
+                    __shfl_xor_sync(0xffffffffu, max0, 1, 4)
+                );
+                max0 = fmaxf(
+                    max0,
+                    __shfl_xor_sync(0xffffffffu, max0, 2, 4)
+                );
+
+                max1 = fmaxf(
+                    max1,
+                    __shfl_xor_sync(0xffffffffu, max1, 1, 4)
+                );
+                max1 = fmaxf(
+                    max1,
+                    __shfl_xor_sync(0xffffffffu, max1, 2, 4)
+                );
+
+                tile_max[0] = fmaxf(tile_max[0], max0);
+                tile_max[1] = fmaxf(tile_max[1], max1);
+            }
         }
 
         const float old_max0 = m_frag[0];
@@ -1139,7 +951,10 @@ __global__ void flashattn_fwd(
     const int row1 = row0 + 8;
     const int col0 = lane4 * 2;
     const int col1 = col0 + 1;
+    const float inv_l0 = 1.0f / l_frag[0];
+    const float inv_l1 = 1.0f / l_frag[1];
 
+    #pragma unroll
     for (int vs = 0; vs < Dv; ++vs) {
         const int output_col0 = vs * 8 + col0;
         const int output_col1 = vs * 8 + col1;
@@ -1148,14 +963,14 @@ __global__ void flashattn_fwd(
             Optr[
                 static_cast<size_t>(row0) * actual_D + output_col0
             ] = __float2half(
-                O_frag[vs * 4 + 0] / l_frag[0]
+                O_frag[vs * 4 + 0] * inv_l0
             );
         }
         if (row0 < Sq && output_col1 < actual_D) {
             Optr[
                 static_cast<size_t>(row0) * actual_D + output_col1
             ] = __float2half(
-                O_frag[vs * 4 + 1] / l_frag[0]
+                O_frag[vs * 4 + 1] * inv_l0
             );
         }
 
@@ -1163,14 +978,14 @@ __global__ void flashattn_fwd(
             Optr[
                 static_cast<size_t>(row1) * actual_D + output_col0
             ] = __float2half(
-                O_frag[vs * 4 + 2] / l_frag[1]
+                O_frag[vs * 4 + 2] * inv_l1
             );
         }
         if (row1 < Sq && output_col1 < actual_D) {
             Optr[
                 static_cast<size_t>(row1) * actual_D + output_col1
             ] = __float2half(
-                O_frag[vs * 4 + 3] / l_frag[1]
+                O_frag[vs * 4 + 3] * inv_l1
             );
         }
     }
@@ -1184,7 +999,6 @@ __global__ void flashattn_fwd(
         }
     }
 }
-
 
 
 
@@ -1372,6 +1186,7 @@ __global__ void flashattn_bwd_dkdv_kernel(
     const int kv_real_last = kv_last_unclamped < Skv
         ? kv_last_unclamped
         : Skv - 1;
+    const bool kv_tile_full = kv_last_unclamped < Skv;
 
     int first_q_tile = 0;
     if constexpr (masked) {
@@ -1499,10 +1314,14 @@ __global__ void flashattn_bwd_dkdv_kernel(
         }
 
         const int q_start = q_tile * Br;
+        const int q_last_unclamped = q_start + Br - 1;
+        const bool q_tile_full = q_last_unclamped < Sq;
         bool needs_causal_mask = false;
         if constexpr (masked) {
             needs_causal_mask = !(kv_real_last <= q_start);
         }
+        const bool needs_any_mask =
+            !q_tile_full || !kv_tile_full || needs_causal_mask;
 
         for (int row = tid; row < Br; row += blockDim.x) {
             const int global_q = q_start + row;
@@ -1520,28 +1339,41 @@ __global__ void flashattn_bwd_dkdv_kernel(
         >(smemQ[current_stage], smemK, score_smem);
         __syncthreads();
 
-        for (int index = tid; index < Br * Bc;
-             index += blockDim.x) {
-            const int row = index / Bc;
-            const int col = index % Bc;
-            const int global_q = q_start + row;
-            const int global_k = kv_start + col;
-
-            bool valid = global_q < Sq && global_k < Skv;
-            if constexpr (masked) {
-                if (needs_causal_mask) {
-                    valid = valid && global_k <= global_q;
-                }
-            }
-
-            float p = 0.0f;
-            if (valid) {
-                p = __expf(
+        if (!needs_any_mask) {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const float p = __expf(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
+                p_ds_smem[col * Br + row] = __float2half(p);
             }
-            p_ds_smem[col * Br + row] = __float2half(p);
+        } else {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const int global_q = q_start + row;
+                const int global_k = kv_start + col;
+
+                bool valid = global_q < Sq && global_k < Skv;
+                if constexpr (masked) {
+                    if (needs_causal_mask) {
+                        valid = valid && global_k <= global_q;
+                    }
+                }
+
+                float p = 0.0f;
+                if (valid) {
+                    p = __expf(
+                        score_smem[row * S_STRIDE + col] * scale -
+                        l_smem[row]
+                    );
+                }
+                p_ds_smem[col * Br + row] = __float2half(p);
+            }
         }
         __syncthreads();
 
@@ -1556,28 +1388,42 @@ __global__ void flashattn_bwd_dkdv_kernel(
         >(smemdO[current_stage], smemV, score_smem);
         __syncthreads();
 
-        for (int index = tid; index < Br * Bc;
-             index += blockDim.x) {
-            const int row = index / Bc;
-            const int col = index % Bc;
-            const int global_q = q_start + row;
-            const int global_k = kv_start + col;
-
-            bool valid = global_q < Sq && global_k < Skv;
-            if constexpr (masked) {
-                if (needs_causal_mask) {
-                    valid = valid && global_k <= global_q;
-                }
-            }
-
-            float ds = 0.0f;
-            if (valid) {
+        if (!needs_any_mask) {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
                 const float p =
                     __half2float(p_ds_smem[col * Br + row]);
                 const float dp = score_smem[row * S_STRIDE + col];
-                ds = p * (dp - delta_smem[row]) * scale;
+                const float ds =
+                    p * (dp - delta_smem[row]) * scale;
+                p_ds_smem[col * Br + row] = __float2half(ds);
             }
-            p_ds_smem[col * Br + row] = __float2half(ds);
+        } else {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const int global_q = q_start + row;
+                const int global_k = kv_start + col;
+
+                bool valid = global_q < Sq && global_k < Skv;
+                if constexpr (masked) {
+                    if (needs_causal_mask) {
+                        valid = valid && global_k <= global_q;
+                    }
+                }
+
+                float ds = 0.0f;
+                if (valid) {
+                    const float p =
+                        __half2float(p_ds_smem[col * Br + row]);
+                    const float dp = score_smem[row * S_STRIDE + col];
+                    ds = p * (dp - delta_smem[row]) * scale;
+                }
+                p_ds_smem[col * Br + row] = __float2half(ds);
+            }
         }
         __syncthreads();
 
@@ -1673,6 +1519,7 @@ __global__ void flashattn_bwd_dq_kernel(
     const int q_real_last = q_last_unclamped < Sq
         ? q_last_unclamped
         : Sq - 1;
+    const bool q_tile_full = q_last_unclamped < Sq;
 
     int kv_tiles_to_process = kv_tiles;
     if constexpr (masked) {
@@ -1807,39 +1654,55 @@ __global__ void flashattn_bwd_dq_kernel(
         const int kv_real_last = kv_last_unclamped < Skv
             ? kv_last_unclamped
             : Skv - 1;
+        const bool kv_tile_full = kv_last_unclamped < Skv;
 
         bool needs_causal_mask = false;
         if constexpr (masked) {
             needs_causal_mask = !(kv_real_last <= q_start);
         }
+        const bool needs_any_mask =
+            !q_tile_full || !kv_tile_full || needs_causal_mask;
 
         mma_score_f16_tiled<
             Br, D_PAD, Bc, Q_STRIDE, K_STRIDE, S_STRIDE
         >(smemQ, smemK[current_stage], score_smem);
         __syncthreads();
 
-        for (int index = tid; index < Br * Bc;
-             index += blockDim.x) {
-            const int row = index / Bc;
-            const int col = index % Bc;
-            const int global_q = q_start + row;
-            const int global_k = kv_start + col;
-
-            bool valid = global_q < Sq && global_k < Skv;
-            if constexpr (masked) {
-                if (needs_causal_mask) {
-                    valid = valid && global_k <= global_q;
-                }
-            }
-
-            float p = 0.0f;
-            if (valid) {
-                p = __expf(
+        if (!needs_any_mask) {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const float p = __expf(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
+                p_ds_smem[row * Bc + col] = __float2half(p);
             }
-            p_ds_smem[row * Bc + col] = __float2half(p);
+        } else {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const int global_q = q_start + row;
+                const int global_k = kv_start + col;
+
+                bool valid = global_q < Sq && global_k < Skv;
+                if constexpr (masked) {
+                    if (needs_causal_mask) {
+                        valid = valid && global_k <= global_q;
+                    }
+                }
+
+                float p = 0.0f;
+                if (valid) {
+                    p = __expf(
+                        score_smem[row * S_STRIDE + col] * scale -
+                        l_smem[row]
+                    );
+                }
+                p_ds_smem[row * Bc + col] = __float2half(p);
+            }
         }
         __syncthreads();
 
@@ -1849,28 +1712,42 @@ __global__ void flashattn_bwd_dq_kernel(
         >(smemdO, smemV[current_stage], score_smem);
         __syncthreads();
 
-        for (int index = tid; index < Br * Bc;
-             index += blockDim.x) {
-            const int row = index / Bc;
-            const int col = index % Bc;
-            const int global_q = q_start + row;
-            const int global_k = kv_start + col;
-
-            bool valid = global_q < Sq && global_k < Skv;
-            if constexpr (masked) {
-                if (needs_causal_mask) {
-                    valid = valid && global_k <= global_q;
-                }
-            }
-
-            float ds = 0.0f;
-            if (valid) {
+        if (!needs_any_mask) {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
                 const float p =
                     __half2float(p_ds_smem[row * Bc + col]);
                 const float dp = score_smem[row * S_STRIDE + col];
-                ds = p * (dp - delta_smem[row]) * scale;
+                const float ds =
+                    p * (dp - delta_smem[row]) * scale;
+                p_ds_smem[row * Bc + col] = __float2half(ds);
             }
-            p_ds_smem[row * Bc + col] = __float2half(ds);
+        } else {
+            #pragma unroll
+            for (int index = tid; index < Br * Bc; index += 128) {
+                const int row = index / Bc;
+                const int col = index % Bc;
+                const int global_q = q_start + row;
+                const int global_k = kv_start + col;
+
+                bool valid = global_q < Sq && global_k < Skv;
+                if constexpr (masked) {
+                    if (needs_causal_mask) {
+                        valid = valid && global_k <= global_q;
+                    }
+                }
+
+                float ds = 0.0f;
+                if (valid) {
+                    const float p =
+                        __half2float(p_ds_smem[row * Bc + col]);
+                    const float dp = score_smem[row * S_STRIDE + col];
+                    ds = p * (dp - delta_smem[row]) * scale;
+                }
+                p_ds_smem[row * Bc + col] = __float2half(ds);
+            }
         }
         __syncthreads();
 
