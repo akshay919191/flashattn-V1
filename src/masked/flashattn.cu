@@ -475,9 +475,10 @@ __global__ void flashattn_fwd(
     const __half* __restrict__ V,
           __half* __restrict__ output,
           float*  __restrict__ Logsum,
-          int actual_D,
-          int Skv,
-          int Sq
+          const int actual_D,
+          const int Skv,
+          const int Sq,
+          const int numKVheads
 ) {
 
     static_assert(Br == 64, "This kernel requires Br == 64");
@@ -485,6 +486,7 @@ __global__ void flashattn_fwd(
                   "Bc must be positive and divisible by 16");
     static_assert(D_PAD > 0 && D_PAD % 16 == 0,
                   "D_PAD must be positive and divisible by 16");
+    
 
     if (blockDim.x != 128) return;
     if (actual_D <= 0 || actual_D > D_PAD || (actual_D & 7) != 0 || Sq <= 0 || Skv <= 0) return;
@@ -499,12 +501,14 @@ __global__ void flashattn_fwd(
     const int tileid = blockIdx.z;
     const int num_heads = gridDim.y;
 
+    const int kv_headid = headid / (num_heads / numKVheads); // headid for this now depends on this for KV
+
     const long long q_base =
         (static_cast<long long>(batchid) * num_heads + headid) *
         Sq * actual_D;
 
     const long long kv_base =
-        (static_cast<long long>(batchid) * num_heads + headid) *
+        (static_cast<long long>(batchid) * numKVheads + kv_headid) *
         Skv * actual_D;
 
     const long long stat_base =
@@ -1006,6 +1010,7 @@ __global__ void flashattn_fwd(
 
 
 namespace flashattn_masked_bwd_detail {
+
 template<int M, int N, int ACC_COUNT>
 __device__ __forceinline__ void store_f16(
     const float (&accumulator)[ACC_COUNT],
@@ -1067,7 +1072,68 @@ __device__ __forceinline__ void store_f16(
     }
 }
 
+template<int M, int N, int ACC_COUNT>
+__device__ __forceinline__ void accumulate_f16(
+    const float (&accumulator)[ACC_COUNT],
+    __half* __restrict__ output,
+    int row_offset,
+    int total_rows,
+    int actual_cols
+) {
+    constexpr int kWarps = 4;
+    constexpr int kMTiles = M / 16;
+    constexpr int kNTiles = N / 8;
+    constexpr int kTotalTiles = kMTiles * kNTiles;
+    constexpr int kTilesPerWarp =
+        (kTotalTiles + kWarps - 1) / kWarps;
+
+    static_assert(ACC_COUNT == kTilesPerWarp * 4,
+                  "Wrong accumulator size");
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_group = lane >> 2;
+    const int lane4 = lane & 3;
+
+    #pragma unroll
+    for (int slot = 0; slot < kTilesPerWarp; ++slot) {
+        const int tile = warp + slot * kWarps;
+        if (tile < kTotalTiles) {
+            const int m_tile = tile / kNTiles;
+            const int n_tile = tile % kNTiles;
+
+            const int local_row0 = m_tile * 16 + row_group;
+            const int local_row1 = local_row0 + 8;
+            const int global_row0 = row_offset + local_row0;
+            const int global_row1 = row_offset + local_row1;
+            const int col0 = n_tile * 8 + lane4 * 2;
+            const int col1 = col0 + 1;
+
+            if (global_row0 < total_rows && col0 < actual_cols) {
+                atomicAdd(
+                    output + static_cast<size_t>(global_row0) * actual_cols + col0,
+                    __float2half(accumulator[slot * 4 + 0]));
+            }
+            if (global_row0 < total_rows && col1 < actual_cols) {
+                atomicAdd(
+                    output + static_cast<size_t>(global_row0) * actual_cols + col1,
+                    __float2half(accumulator[slot * 4 + 1]));
+            }
+            if (global_row1 < total_rows && col0 < actual_cols) {
+                atomicAdd(
+                    output + static_cast<size_t>(global_row1) * actual_cols + col0,
+                    __float2half(accumulator[slot * 4 + 2]));
+            }
+            if (global_row1 < total_rows && col1 < actual_cols) {
+                atomicAdd(
+                    output + static_cast<size_t>(global_row1) * actual_cols + col1,
+                    __float2half(accumulator[slot * 4 + 3]));
+            }
+        }
+    }
 }
+
+} // namespace flashattn_masked_bwd_detail
 
 template<int D_PAD>
 __global__ void flashattn_bwd_delta_kernel(
@@ -1122,7 +1188,8 @@ __global__ void flashattn_bwd_dkdv_kernel(
           __half* __restrict__ dV,
           int actual_D,
           int Skv,
-          int Sq
+          int Sq,
+          const int numKVheads
 ) {
     static_assert(Br > 0 && Br % 16 == 0,
                   "Br must be divisible by 16");
@@ -1159,11 +1226,13 @@ __global__ void flashattn_bwd_dkdv_kernel(
     const int kv_tile = blockIdx.z;
     const int heads = gridDim.y;
 
+    const int kv_headid = head / (heads / numKVheads);
+
     const long long q_base =
         (static_cast<long long>(batch) * heads + head) *
         Sq * actual_D;
     const long long kv_base =
-        (static_cast<long long>(batch) * heads + head) *
+        (static_cast<long long>(batch) * numKVheads + kv_headid) *
         Skv * actual_D;
     const long long stat_base =
         (static_cast<long long>(batch) * heads + head) * Sq;
@@ -1191,12 +1260,6 @@ __global__ void flashattn_bwd_dkdv_kernel(
     int first_q_tile = 0;
     if constexpr (masked) {
         if (kv_start >= Sq) {
-            flashattn_masked_bwd_detail::store_f16<
-                Bc, D_PAD, kAccumulatorCount
-            >(dK_fragment, dKptr, kv_start, Skv, actual_D);
-            flashattn_masked_bwd_detail::store_f16<
-                Bc, D_PAD, kAccumulatorCount
-            >(dV_fragment, dVptr, kv_start, Skv, actual_D);
             return;
         }
         first_q_tile = kv_start / Br;
@@ -1438,10 +1501,10 @@ __global__ void flashattn_bwd_dkdv_kernel(
         }
     }
 
-    flashattn_masked_bwd_detail::store_f16<
+    flashattn_masked_bwd_detail::accumulate_f16<
         Bc, D_PAD, kAccumulatorCount
     >(dK_fragment, dKptr, kv_start, Skv, actual_D);
-    flashattn_masked_bwd_detail::store_f16<
+    flashattn_masked_bwd_detail::accumulate_f16<
         Bc, D_PAD, kAccumulatorCount
     >(dV_fragment, dVptr, kv_start, Skv, actual_D);
 }
@@ -1458,7 +1521,8 @@ __global__ void flashattn_bwd_dq_kernel(
           __half* __restrict__ dQ,
           int actual_D,
           int Skv,
-          int Sq
+          int Sq,
+          const int numKVheads
 ) {
     static_assert(Br > 0 && Br % 16 == 0,
                   "Br must be divisible by 16");
@@ -1493,11 +1557,13 @@ __global__ void flashattn_bwd_dq_kernel(
     const int q_tile = blockIdx.z;
     const int heads = gridDim.y;
 
+    const int kv_headid = head / (heads / numKVheads);
+
     const long long q_base =
         (static_cast<long long>(batch) * heads + head) *
         Sq * actual_D;
     const long long kv_base =
-        (static_cast<long long>(batch) * heads + head) *
+        (static_cast<long long>(batch) * numKVheads + kv_headid) *
         Skv * actual_D;
     const long long stat_base =
         (static_cast<long long>(batch) * heads + head) * Sq;
@@ -1846,8 +1912,6 @@ static void check_qkv(
     TORCH_CHECK(Q.device() == V.device(), "Q and V must be on the same CUDA device");
     TORCH_CHECK(Q.size(0) == K.size(0), "Q and K batch dimensions must match");
     TORCH_CHECK(Q.size(0) == V.size(0), "Q and V batch dimensions must match");
-    TORCH_CHECK(Q.size(1) == K.size(1), "Q and K head counts must match");
-    TORCH_CHECK(Q.size(1) == V.size(1), "Q and V head counts must match");
     TORCH_CHECK(K.size(2) == V.size(2), "K and V sequence lengths must match");
     TORCH_CHECK(Q.size(3) == K.size(3), "Q and K head dimensions must match");
     TORCH_CHECK(Q.size(3) == V.size(3), "Q and V head dimensions must match");
@@ -1911,6 +1975,7 @@ static std::vector<torch::Tensor> launch_fwd_impl(
     const int Sq = static_cast<int>(Q.size(2));
     const int Skv = static_cast<int>(K.size(2));
     const int actual_D = static_cast<int>(Q.size(3));
+    const int kvhead = static_cast<int>(K.size(1));
 
     auto O = torch::empty_like(Q);
     auto L = torch::empty(
@@ -1937,7 +2002,8 @@ static std::vector<torch::Tensor> launch_fwd_impl(
             L.data_ptr<float>(),
             actual_D,
             Skv,
-            Sq
+            Sq,
+            kvhead
         );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1980,6 +2046,7 @@ static std::vector<torch::Tensor> launch_bwd_impl(
     const int Sq = static_cast<int>(Q.size(2));
     const int Skv = static_cast<int>(K.size(2));
     const int actual_D = static_cast<int>(Q.size(3));
+    const int kvhead = static_cast<int>(K.size(1));
 
     const int64_t total_rows_64 =
         static_cast<int64_t>(B) * H * Sq;
@@ -1993,8 +2060,8 @@ static std::vector<torch::Tensor> launch_bwd_impl(
     TORCH_CHECK((Sq + Br - 1) / Br <= 65535, "Sq requires too many backward tiles");
 
     auto dQ = torch::empty_like(Q);
-    auto dK = torch::empty_like(K);
-    auto dV = torch::empty_like(V);
+    auto dK = torch::zeros_like(K);
+    auto dV = torch::zeros_like(V);
     auto Delta = torch::empty(
         {Q.size(0), Q.size(1), Q.size(2)},
         Q.options().dtype(torch::kFloat32)
@@ -2041,7 +2108,8 @@ static std::vector<torch::Tensor> launch_bwd_impl(
             reinterpret_cast<__half*>(dV.data_ptr<at::Half>()),
             actual_D,
             Skv,
-            Sq
+            Sq,
+            kvhead
         );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2067,7 +2135,8 @@ static std::vector<torch::Tensor> launch_bwd_impl(
             reinterpret_cast<__half*>(dQ.data_ptr<at::Half>()),
             actual_D,
             Skv,
-            Sq
+            Sq,
+            kvhead
         );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
