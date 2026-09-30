@@ -1,14 +1,3 @@
-# setup.py -- builds the pagedattn CUDA extension.
-#
-# Layout assumed:
-#   ./
-#     ├── setup.py
-#     ├── extension.cpp
-#     ├── pagedattn.cu
-#     └── helper.cuh
-#
-# Build:
-#   pip install -e .            # or: python setup.py build_ext --inplace
 
 import os
 import sys
@@ -32,22 +21,7 @@ if not _have_cuda_toolkit():
     )
 
 
-# ---------------------------------------------------------------------------
-# nvcc flags
-# ---------------------------------------------------------------------------
-# Target only sm_80 and sm_90 -- the kernel uses cp.async (sm_80) and the
-# m16n8k16 MMA.  Add sm_86/sm_89 if you need them (they share the sm_80 SASS
-# but a separate gencode can help register allocation).
-#
-#   -O3                        : release codegen
-#   --expt-relaxed-constexpr   : forward declare constexpr device code cleanly
-#   --ptxas-options=-v         : register / smem usage per kernel (remove for CI)
-#
-# NOTE: --use_fast_math is deliberately NOT enabled.  The kernels already
-# call __expf / __logf explicitly, and turning on fast-math globally changes
-# denormal/NaN handling which the softmax math relies on.  If you want it,
-# benchmark before you ship it -- some models see accuracy regressions.
-
+# 
 NVCC_FLAGS = [
     "-O3",
     "-std=c++17",
