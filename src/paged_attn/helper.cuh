@@ -1,6 +1,3 @@
-#ifndef MMA_HELPERS_CUH
-#define MMA_HELPERS_CUH
-
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -12,6 +9,11 @@
 
 #define WARP_FULL_MASK 0xffffffff
 
+// Converts a generic pointer into the shared-memory (.b16-addressable) 32-bit
+// address that ldmatrix / cp.async instructions require. Must go through a
+// 64-bit intermediate register on the generic->shared conversion; feeding a
+// 64-bit operand straight into cvta.to.shared.u32 does not assemble on
+// sm_80/sm_90 (ptxas: "Arguments mismatch for instruction 'cvta.to'").
 __device__ __forceinline__ uint32_t smem_u32_ptr(const void* ptr) {
     uint32_t addr;
     asm volatile(
@@ -51,14 +53,6 @@ __device__ __forceinline__ void ldmatrix_x2_trans(uint32_t* frag, uint32_t smem_
     );
 }
 
-__device__ __forceinline__ uint32_t pack_float2_to_half2_u32(float x, float y) {
-    __half2 h2 = __floats2half2_rn(x, y);
-    return *reinterpret_cast<uint32_t*>(&h2);
-}
-
-
-
-
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&frag)[4], uint32_t smem_int_ptr) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -67,19 +61,31 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&frag)[4], uint32_t 
     );
 }
 
-// Helper to compute the exact smem ptr for ldmatrix
+__device__ __forceinline__ uint32_t pack_float2_to_half2_u32(float x, float y) {
+    __half2 h2 = __floats2half2_rn(x, y);
+    return *reinterpret_cast<uint32_t*>(&h2);
+}
+
+__device__ __forceinline__ uint32_t pack_half2_u32(__half x, __half y) {
+    __half2 h2 = __halves2half2(x, y);
+    return *reinterpret_cast<uint32_t*>(&h2);
+}
+
+// compatibility, but the column stride here has not been validated the way
+// the rest of this file has — audit the (row, col) formula against your
+// ldmatrix call site before relying on it.
 __device__ __forceinline__ uint32_t get_smem_ptr(const void* ptr, int row, int col, int stride) {
-    // row is 0-7 within the 8x8 ldmatrix block
-    // lane layout: lane % 8 determines the row.
-    // lane / 8 determines which of the 4 matrices is being loaded.
     int lane = threadIdx.x % 32;
     int r = row + (lane % 8) + (lane / 16) * 8;
     int c = col + ((lane / 8) % 2) * 8;
     return smem_u32_ptr(reinterpret_cast<const __half*>(ptr) + r * stride + c);
 }
 
-
-
+// Async global->shared tile load with boundary zero-fill. Builds an explicit
+// .pred register with setp.ne from a plain 32-bit int flag. (An earlier
+// variant tried to pass a C++ bool straight in under an "b" asm constraint —
+// nvcc rejects that: "asm operand type size(1) does not match type/size
+// implied by constraint 'b'". The predicate must be materialized this way.)
 template<int Rows, int Cols, int blockdim>
 __device__ __forceinline__ void asyncLOAD_2D_TILE(
     const __half* matrix,
@@ -107,12 +113,11 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
         uint32_t smemaddr = smemptr + (local_row * smem_stride + local_col) * sizeof(__half);
 
         bool is_valid = (global_row < total_rows) && (global_col + 7 < total_cols);
-
-        const __half* globalsrc = is_valid 
-            ? matrix + (size_t)global_row * global_stride + global_col 
-            : matrix;
-
         int predicate = is_valid ? 1 : 0;
+
+        const __half* globalsrc = is_valid
+            ? matrix + (size_t)global_row * global_stride + global_col
+            : matrix;
 
         asm volatile(
             "{\n"
@@ -130,7 +135,27 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
     }
 }
 
-// Computes C[M,N] = A[M,K] @ B[N,K]^T; A and B are row-major.
+// Packs two __half values into one b32 register, zero-filling whichever
+// element is out of bounds independently, rather than zeroing the whole
+// pair whenever either half is out of range. This matters at odd/tail K
+// boundaries: e.g. K=17 with a 2-wide load at k0=16 previously discarded
+// the valid element at k0=16 just because k0+1=17 was out of range.
+__device__ __forceinline__ uint32_t safe_pack_half2(const __half* ptr, bool v0, bool v1) {
+    __half h0 = v0 ? ptr[0] : __float2half(0.0f);
+    __half h1 = v1 ? ptr[1] : __float2half(0.0f);
+    __half2 h2 = __halves2half2(h0, h1);
+    uint32_t res;
+    __builtin_memcpy(&res, &h2, sizeof(uint32_t));
+    return res;
+}
+
+// Runtime-shaped (non-templated) m16n8k16 GEMM-ish tile loop for A [M,K] row
+// major, B [N,K] row major (used col-major in the mma), C [M,N]. Uses
+// direct addressing (no ldmatrix) because M/K/N are not compile-time
+// constants, so A/B must be reachable with plain loads (typically shared
+// memory laid out linearly, or global memory if you accept the extra
+// latency). Boundary reads use safe_pack_half2 so a valid element next to
+// an out-of-range one is never silently dropped.
 __device__ __forceinline__ void mma_score_strided(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
@@ -171,15 +196,15 @@ __device__ __forceinline__ void mma_score_strided(
 
             int a_row0 = row_start + group;
             int a_row1 = row_start + group + 8;
-            int b_row = col_start + group;
+            int b_row  = col_start + group;
 
-            a_frag[0] = (a_row0 < M && k0 + 1 < K) ? *reinterpret_cast<const uint32_t*>(&A[a_row0 * A_STRIDE + k0]) : 0;
-            a_frag[1] = (a_row1 < M && k0 + 1 < K) ? *reinterpret_cast<const uint32_t*>(&A[a_row1 * A_STRIDE + k0]) : 0;
-            a_frag[2] = (a_row0 < M && k0 + 9 < K) ? *reinterpret_cast<const uint32_t*>(&A[a_row0 * A_STRIDE + k0 + 8]) : 0;
-            a_frag[3] = (a_row1 < M && k0 + 9 < K) ? *reinterpret_cast<const uint32_t*>(&A[a_row1 * A_STRIDE + k0 + 8]) : 0;
+            a_frag[0] = (a_row0 < M) ? safe_pack_half2(&A[a_row0 * A_STRIDE + k0],     k0 < K,     (k0 + 1) < K) : 0;
+            a_frag[1] = (a_row1 < M) ? safe_pack_half2(&A[a_row1 * A_STRIDE + k0],     k0 < K,     (k0 + 1) < K) : 0;
+            a_frag[2] = (a_row0 < M) ? safe_pack_half2(&A[a_row0 * A_STRIDE + k0 + 8], (k0 + 8) < K, (k0 + 9) < K) : 0;
+            a_frag[3] = (a_row1 < M) ? safe_pack_half2(&A[a_row1 * A_STRIDE + k0 + 8], (k0 + 8) < K, (k0 + 9) < K) : 0;
 
-            b_frag[0] = (b_row < N && k0 + 1 < K) ? *reinterpret_cast<const uint32_t*>(&B[b_row * B_STRIDE + k0]) : 0;
-            b_frag[1] = (b_row < N && k0 + 9 < K) ? *reinterpret_cast<const uint32_t*>(&B[b_row * B_STRIDE + k0 + 8]) : 0;
+            b_frag[0] = (b_row < N) ? safe_pack_half2(&B[b_row * B_STRIDE + k0],     k0 < K,     (k0 + 1) < K) : 0;
+            b_frag[1] = (b_row < N) ? safe_pack_half2(&B[b_row * B_STRIDE + k0 + 8], (k0 + 8) < K, (k0 + 9) < K) : 0;
 
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -202,251 +227,9 @@ __device__ __forceinline__ void mma_score_strided(
     }
 }
 
-__device__ __forceinline__ uint32_t pack_half2_u32(__half x, __half y) {
-    __half2 h2 = __halves2half2(x, y);
-    return *reinterpret_cast<uint32_t*>(&h2);
-}
-
-
-template<int Br, int D, int O_STRIDE>
-__device__ __forceinline__ void oaccSCALING_smem(
-    float* __restrict__ Osmem,
-    const float* __restrict__ Alphasmem
-) {
-    int tid = threadIdx.x;
-    for (int i = tid; i < Br * D; i += blockDim.x) {
-        int row = i / D;
-        int col = i % D;
-        Osmem[row * O_STRIDE + col] *= Alphasmem[row];
-    }
-}
-
-__device__ __forceinline__ void mma_pv_accum_f32p_f16v(
-    const float*  __restrict__ P,
-    const __half* __restrict__ V,
-    float*        __restrict__ Oacc,
-    int M, int K, int N,
-    int P_STRIDE, int V_STRIDE, int O_STRIDE
-) {
-    int tid  = threadIdx.x;
-    int warp = tid >> 5;
-    int lane = tid & 31;
-    int warps_per_block = blockDim.x >> 5;
-    int group = lane >> 2;
-    int tid4  = lane & 3;
-
-    constexpr int MMA_M = 16;
-    constexpr int MMA_N = 8;
-    constexpr int MMA_K = 16;
-
-    int num_m_tiles = (M + 15) / 16;
-    int num_n_tiles = (N + 7)  / 8;
-    int num_k_tiles = (K + 15) / 16;
-    int total_tiles = num_m_tiles * num_n_tiles;
-
-    for (int tile_idx = warp; tile_idx < total_tiles; tile_idx += warps_per_block) {
-        int mt = tile_idx / num_n_tiles;
-        int nt = tile_idx % num_n_tiles;
-        int row_start = mt * MMA_M;
-        int col_start = nt * MMA_N;
-
-        int c_row0 = row_start + group;
-        int c_row1 = row_start + group + 8;
-        int c_col0 = col_start + tid4 * 2;
-        int c_col1 = c_col0 + 1;
-
-        float acc[4];
-        acc[0] = (c_row0 < M && c_col0 < N) ? Oacc[c_row0 * O_STRIDE + c_col0] : 0.f;
-        acc[1] = (c_row0 < M && c_col1 < N) ? Oacc[c_row0 * O_STRIDE + c_col1] : 0.f;
-        acc[2] = (c_row1 < M && c_col0 < N) ? Oacc[c_row1 * O_STRIDE + c_col0] : 0.f;
-        acc[3] = (c_row1 < M && c_col1 < N) ? Oacc[c_row1 * O_STRIDE + c_col1] : 0.f;
-
-        for (int kt = 0; kt < num_k_tiles; kt++) {
-            int k_start = kt * MMA_K;
-            int k0 = k_start + tid4 * 2;
-
-            uint32_t a_frag[4];
-            uint32_t b_frag[2];
-
-            int a_row0 = row_start + group;
-            int a_row1 = row_start + group + 8;
-
-            float p00 = (a_row0 < M && k0 < K)     ? P[a_row0 * P_STRIDE + k0]     : 0.f;
-            float p01 = (a_row0 < M && k0 + 1 < K) ? P[a_row0 * P_STRIDE + k0 + 1] : 0.f;
-            float p10 = (a_row1 < M && k0 < K)     ? P[a_row1 * P_STRIDE + k0]     : 0.f;
-            float p11 = (a_row1 < M && k0 + 1 < K) ? P[a_row1 * P_STRIDE + k0 + 1] : 0.f;
-            float p02 = (a_row0 < M && k0 + 8 < K) ? P[a_row0 * P_STRIDE + k0 + 8] : 0.f;
-            float p03 = (a_row0 < M && k0 + 9 < K) ? P[a_row0 * P_STRIDE + k0 + 9] : 0.f;
-            float p12 = (a_row1 < M && k0 + 8 < K) ? P[a_row1 * P_STRIDE + k0 + 8] : 0.f;
-            float p13 = (a_row1 < M && k0 + 9 < K) ? P[a_row1 * P_STRIDE + k0 + 9] : 0.f;
-
-            a_frag[0] = pack_float2_to_half2_u32(p00, p01);
-            a_frag[1] = pack_float2_to_half2_u32(p10, p11);
-            a_frag[2] = pack_float2_to_half2_u32(p02, p03);
-            a_frag[3] = pack_float2_to_half2_u32(p12, p13);
-
-            int out_col = col_start + group;
-
-            __half v00 = (k0 < K && out_col < N) ? V[k0 * V_STRIDE + out_col] : __float2half(0.f);
-            __half v01 = (k0 + 1 < K && out_col < N) ? V[(k0 + 1) * V_STRIDE + out_col] : __float2half(0.f);
-            __half v10 = (k0 + 8 < K && out_col < N) ? V[(k0 + 8) * V_STRIDE + out_col] : __float2half(0.f);
-            __half v11 = (k0 + 9 < K && out_col < N) ? V[(k0 + 9) * V_STRIDE + out_col] : __float2half(0.f);
-
-            b_frag[0] = pack_half2_u32(v00, v01);
-            b_frag[1] = pack_half2_u32(v10, v11);
-
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
-                  "r"(b_frag[0]), "r"(b_frag[1])
-            );
-        }
-
-        if (c_row0 < M && c_col0 < N) Oacc[c_row0 * O_STRIDE + c_col0] = acc[0];
-        if (c_row0 < M && c_col1 < N) Oacc[c_row0 * O_STRIDE + c_col1] = acc[1];
-        if (c_row1 < M && c_col0 < N) Oacc[c_row1 * O_STRIDE + c_col0] = acc[2];
-        if (c_row1 < M && c_col1 < N) Oacc[c_row1 * O_STRIDE + c_col1] = acc[3];
-    }
-}
-
-__device__ __forceinline__ void mma_accum_f16p_f16v_smem(
-    const __half* __restrict__ A,
-    const __half* __restrict__ B,
-    float*        __restrict__ C,
-    int M,
-    int K,
-    int N,
-    int A_stride,
-    int B_stride,
-    int C_stride
-) {
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int warps_per_block = blockDim.x >> 5;
-    const int group = lane >> 2;
-    const int lane4 = lane & 3;
-
-    const int num_m_tiles = (M + 15) / 16;
-    const int num_n_tiles = (N + 7) / 8;
-    const int num_k_tiles = (K + 15) / 16;
-    const int total_tiles = num_m_tiles * num_n_tiles;
-
-    for (int tile = warp; tile < total_tiles; tile += warps_per_block) {
-        const int m_tile = tile / num_n_tiles;
-        const int n_tile = tile % num_n_tiles;
-        const int row_start = m_tile * 16;
-        const int col_start = n_tile * 8;
-
-        const int out_row0 = row_start + group;
-        const int out_row1 = out_row0 + 8;
-        const int out_col0 = col_start + lane4 * 2;
-        const int out_col1 = out_col0 + 1;
-
-        float acc[4];
-        acc[0] = (out_row0 < M && out_col0 < N)
-            ? C[out_row0 * C_stride + out_col0]
-            : 0.0f;
-        acc[1] = (out_row0 < M && out_col1 < N)
-            ? C[out_row0 * C_stride + out_col1]
-            : 0.0f;
-        acc[2] = (out_row1 < M && out_col0 < N)
-            ? C[out_row1 * C_stride + out_col0]
-            : 0.0f;
-        acc[3] = (out_row1 < M && out_col1 < N)
-            ? C[out_row1 * C_stride + out_col1]
-            : 0.0f;
-
-        for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-            const int k0 = k_tile * 16 + lane4 * 2;
-
-            const int a_row0 = row_start + group;
-            const int a_row1 = a_row0 + 8;
-            const int b_col = col_start + group;
-
-            const __half zero = __float2half(0.0f);
-
-            const __half a00 = (a_row0 < M && k0 < K)
-                ? A[a_row0 * A_stride + k0]
-                : zero;
-            const __half a01 = (a_row0 < M && k0 + 1 < K)
-                ? A[a_row0 * A_stride + k0 + 1]
-                : zero;
-            const __half a10 = (a_row1 < M && k0 < K)
-                ? A[a_row1 * A_stride + k0]
-                : zero;
-            const __half a11 = (a_row1 < M && k0 + 1 < K)
-                ? A[a_row1 * A_stride + k0 + 1]
-                : zero;
-            const __half a20 = (a_row0 < M && k0 + 8 < K)
-                ? A[a_row0 * A_stride + k0 + 8]
-                : zero;
-            const __half a21 = (a_row0 < M && k0 + 9 < K)
-                ? A[a_row0 * A_stride + k0 + 9]
-                : zero;
-            const __half a30 = (a_row1 < M && k0 + 8 < K)
-                ? A[a_row1 * A_stride + k0 + 8]
-                : zero;
-            const __half a31 = (a_row1 < M && k0 + 9 < K)
-                ? A[a_row1 * A_stride + k0 + 9]
-                : zero;
-
-            uint32_t a_frag[4];
-            a_frag[0] = pack_half2_u32(a00, a01);
-            a_frag[1] = pack_half2_u32(a10, a11);
-            a_frag[2] = pack_half2_u32(a20, a21);
-            a_frag[3] = pack_half2_u32(a30, a31);
-
-            // Correct row-major B[K,N] indexing. The old helper used
-            // B[b_col * stride + k], which interpreted B as [N,K].
-            const __half b00 = (k0 < K && b_col < N)
-                ? B[k0 * B_stride + b_col]
-                : zero;
-            const __half b01 = (k0 + 1 < K && b_col < N)
-                ? B[(k0 + 1) * B_stride + b_col]
-                : zero;
-            const __half b10 = (k0 + 8 < K && b_col < N)
-                ? B[(k0 + 8) * B_stride + b_col]
-                : zero;
-            const __half b11 = (k0 + 9 < K && b_col < N)
-                ? B[(k0 + 9) * B_stride + b_col]
-                : zero;
-
-            uint32_t b_frag[2];
-            b_frag[0] = pack_half2_u32(b00, b01);
-            b_frag[1] = pack_half2_u32(b10, b11);
-
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0, %1, %2, %3}, "
-                "{%4, %5, %6, %7}, "
-                "{%8, %9}, "
-                "{%0, %1, %2, %3};\n"
-                : "+f"(acc[0]), "+f"(acc[1]),
-                  "+f"(acc[2]), "+f"(acc[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]),
-                  "r"(a_frag[2]), "r"(a_frag[3]),
-                  "r"(b_frag[0]), "r"(b_frag[1])
-            );
-        }
-
-        if (out_row0 < M && out_col0 < N) {
-            C[out_row0 * C_stride + out_col0] = acc[0];
-        }
-        if (out_row0 < M && out_col1 < N) {
-            C[out_row0 * C_stride + out_col1] = acc[1];
-        }
-        if (out_row1 < M && out_col0 < N) {
-            C[out_row1 * C_stride + out_col0] = acc[2];
-        }
-        if (out_row1 < M && out_col1 < N) {
-            C[out_row1 * C_stride + out_col1] = acc[3];
-        }
-    }
-}
-
+// Compile-time-shaped m16n8k16 GEMM tile loop using ldmatrix out of shared
+// memory. A [M,K] row major, B [N,K] row major (used col-major in the mma),
+// C [M,N] written directly (not accumulated across calls).
 template<
     int M,
     int K,
@@ -538,11 +321,9 @@ __device__ __forceinline__ void mma_score_f16_tiled(
     }
 }
 
-// ----------------------------------------------------------------------------
-// Register-resident row-major MMA accumulation
-// ----------------------------------------------------------------------------
-// Computes C[M,N] += A[M,K] @ B[K,N], keeping each warp's C fragments in the
-// caller-provided register array. A and B must reside in shared memory.
+// Same shape as mma_score_f16_tiled, but accumulates into a caller-owned
+// register array across repeated calls (e.g. across K-blocks of a larger
+// GEMM) instead of writing straight to global/shared C.
 template<
     int M,
     int K,
@@ -604,8 +385,10 @@ __device__ __forceinline__ void mma_accum_f16_registers(
                 const int b_row = k_tile * 16 + (lane & 15);
                 const int b_col = n_tile * 8;
 
-                // B is physical row-major [K,N]. A transposed ldmatrix load
-                // produces the mma.row.col B fragment directly.
+                // NOTE: this was calling a never-defined "ldmatrix_x2_trans"
+                // by name in one variant of this file (undefined-identifier
+                // compile error). The correctly-defined transposed 2-frag
+                // loader in this file is ldmatrix_x2_trans, defined above.
                 ldmatrix_x2_trans(
                     b_frag,
                     smem_u32_ptr(B + b_row * B_STRIDE + b_col)
@@ -632,8 +415,6 @@ __device__ __forceinline__ void mma_accum_f16_registers(
     }
 }
 
-// Stores register-resident m16n8 accumulator fragments to a row-major fp16
-// global matrix. row_offset identifies this block's first global output row.
 template<int M, int N, int ACC_COUNT>
 __device__ __forceinline__ void store_f16_registers(
     const float (&acc)[ACC_COUNT],
@@ -696,5 +477,3 @@ __device__ __forceinline__ void store_f16_registers(
         }
     }
 }
-
-#endif  // MMA_HELPERS_CUH
