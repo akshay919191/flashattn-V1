@@ -1,8 +1,7 @@
 #ifndef FLASHATTN_MASKED_SINGLE_FILE_CUH
 #define FLASHATTN_MASKED_SINGLE_FILE_CUH
 
-
-
+//
 
 #ifndef MMA_HELPERS_CUH
 #define MMA_HELPERS_CUH
@@ -62,9 +61,6 @@ __device__ __forceinline__ uint32_t pack_float2_to_half2_u32(float x, float y) {
     return *reinterpret_cast<uint32_t*>(&h2);
 }
 
-
-
-
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&frag)[4], uint32_t smem_int_ptr) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -73,7 +69,6 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&frag)[4], uint32_t 
     );
 }
 
-
 __device__ __forceinline__ uint32_t get_smem_ptr(const void* ptr, int row, int col, int stride) {
     int lane = threadIdx.x % 32;
     int r = row + (lane % 8) + (lane / 16) * 8;
@@ -81,8 +76,12 @@ __device__ __forceinline__ uint32_t get_smem_ptr(const void* ptr, int row, int c
     return smem_u32_ptr(reinterpret_cast<const __half*>(ptr) + r * stride + c);
 }
 
-
-
+// ---------------------------------------------------------------------------
+// [FIX] Loads a Rows x Cols half tile into smem with cp.async, zero-padding
+// OOB rows/cols. Fast path: 16B-aligned gmem rows (global_stride % 8 == 0)
+// with a tail-fixup for total_cols % 8 != 0. Scalar fallback otherwise.
+// Supports ANY total_cols in [1, Cols]. (Signature unchanged.)
+// ---------------------------------------------------------------------------
 template<int Rows, int Cols, int blockdim>
 __device__ __forceinline__ void asyncLOAD_2D_TILE(
     const __half* matrix,
@@ -96,43 +95,82 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
     int           col_start
 ) {
     static_assert(Cols % 8 == 0, "Cols must be divisible by 8 for 16-byte cp.async loads");
-    constexpr int halfs_per_async = 8;
-    constexpr int vecs_per_tile = (Rows * Cols) / halfs_per_async;
+    constexpr int VEC          = 8;
+    constexpr int chunks_x     = Cols / VEC;
+    constexpr int total_chunks = (Rows * Cols) / VEC;
 
-    for (int i = tid; i < vecs_per_tile; i += blockdim) {
-        int logical_offset = i * halfs_per_async;
-        int local_row = logical_offset / Cols;
-        int local_col = logical_offset % Cols;
+    const int full_cols = total_cols & ~7;
+    const int tail      = total_cols - full_cols;
+    const bool vec_ok   = (global_stride % VEC) == 0;
 
-        int global_row = row_tile * Rows + local_row;
-        int global_col = col_start + local_col;
+    if (vec_ok) {
+        for (int i = tid; i < total_chunks; i += blockdim) {
+            const int lr = i / chunks_x;
+            const int c8 = (i % chunks_x) * VEC;
+            const int gr = row_tile * Rows + lr;
+            const int gc = col_start + c8;
 
-        uint32_t smemaddr = smemptr + (local_row * smem_stride + local_col) * sizeof(__half);
+            const uint32_t smemaddr =
+                smemptr + (lr * smem_stride + c8) * (int)sizeof(__half);
 
-        bool is_valid = (global_row < total_rows) && (global_col + 7 < total_cols);
+            const bool row_ok  = (gr < total_rows);
+            const bool do_load = row_ok && (c8 < full_cols);
+            // ragged partial chunk handled synchronously below (must not
+            // race the async zero-fill of the same smem region)
+            const bool skip    = row_ok && (c8 == full_cols) && (tail != 0);
 
-        const __half* globalsrc = is_valid
-            ? matrix + (size_t)global_row * global_stride + global_col
-            : matrix;
+            const __half* src = do_load
+                ? matrix + (size_t)gr * global_stride + gc
+                : matrix;
+            const int nbytes = do_load ? 16 : 0;   // 0 -> pure zero fill
 
-        int predicate = is_valid ? 1 : 0;
-
-        asm volatile(
-            "{\n"
-            "  .reg .pred p;\n"
-            "  .reg .u32 z;\n"
-            "  mov.u32 z, 0;\n"
-            "  setp.ne.b32 p, %2, 0;\n"
-            "  @p  cp.async.cg.shared.global [%0], [%1], 16;\n"
-            "  @!p st.shared.v4.b32 [%0], {z, z, z, z};\n"
-            "}\n"
-            :
-            : "r"(smemaddr), "l"(globalsrc), "r"(predicate)
-            : "memory"
-        );
+            if (!skip) {
+                asm volatile(
+                    "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                    :
+                    : "r"(smemaddr), "l"(src), "r"(nbytes)
+                    : "memory"
+                );
+            }
+        }
+        if (tail != 0) {
+            for (int r = tid; r < Rows; r += blockdim) {
+                const int gr = row_tile * Rows + r;
+                const bool row_ok = (gr < total_rows);
+                const uint32_t d =
+                    smemptr + (r * smem_stride + full_cols) * (int)sizeof(__half);
+                for (int j = 0; j < VEC; ++j) {
+                    uint16_t v = 0;
+                    if (row_ok && j < tail) {
+                        const __half h =
+                            matrix[(size_t)gr * global_stride + full_cols + j];
+                        v = *reinterpret_cast<const uint16_t*>(&h);
+                    }
+                    asm volatile("st.shared.u16 [%0], %1;\n"
+                                 :: "r"(d + j * (int)sizeof(__half)), "h"(v)
+                                 : "memory");
+                }
+            }
+        }
+    } else {
+        // [FIX] scalar fallback: gmem rows not 16B-aligned (actual_D % 8 != 0)
+        for (int i = tid; i < Rows * Cols; i += blockdim) {
+            const int lr = i / Cols;
+            const int lc = i % Cols;
+            const int gr = row_tile * Rows + lr;
+            const int gc = col_start + lc;
+            uint16_t v = 0;
+            if (gr < total_rows && gc < total_cols) {
+                const __half h = matrix[(size_t)gr * global_stride + gc];
+                v = *reinterpret_cast<const uint16_t*>(&h);
+            }
+            const uint32_t smemaddr =
+                smemptr + (lr * smem_stride + lc) * (int)sizeof(__half);
+            asm volatile("st.shared.u16 [%0], %1;\n"
+                         :: "r"(smemaddr), "h"(v) : "memory");
+        }
     }
 }
-
 
 __device__ __forceinline__ void mma_score_strided(
     const __half* __restrict__ A,
@@ -209,8 +247,6 @@ __device__ __forceinline__ uint32_t pack_half2_u32(__half x, __half y) {
     __half2 h2 = __halves2half2(x, y);
     return *reinterpret_cast<uint32_t*>(&h2);
 }
-
-
 
 template<
     int M,
@@ -303,8 +339,6 @@ __device__ __forceinline__ void mma_score_f16_tiled(
     }
 }
 
-
-
 template<
     int M,
     int K,
@@ -366,8 +400,6 @@ __device__ __forceinline__ void mma_accum_f16_registers(
                 const int b_row = k_tile * 16 + (lane & 15);
                 const int b_col = n_tile * 8;
 
-
-
                 ldmatrix_x2_trans(
                     b_frag,
                     smem_u32_ptr(B + b_row * B_STRIDE + b_col)
@@ -393,8 +425,6 @@ __device__ __forceinline__ void mma_accum_f16_registers(
         }
     }
 }
-
-
 
 template<int M, int N, int ACC_COUNT>
 __device__ __forceinline__ void store_f16_registers(
@@ -459,17 +489,15 @@ __device__ __forceinline__ void store_f16_registers(
     }
 }
 
-#endif
+#endif  // MMA_HELPERS_CUH
 
 
-
-
-
-
-
-
+// ===========================================================================
+// FORWARD
+// ===========================================================================
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void flashattn_fwd(
+__global__ void __launch_bounds__(128)   // [FIX]
+flashattn_fwd(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -480,16 +508,15 @@ __global__ void flashattn_fwd(
           const int Sq,
           const int numKVheads
 ) {
-
     static_assert(Br == 64, "This kernel requires Br == 64");
     static_assert(Bc > 0 && Bc % 16 == 0,
                   "Bc must be positive and divisible by 16");
     static_assert(D_PAD > 0 && D_PAD % 16 == 0,
                   "D_PAD must be positive and divisible by 16");
-    
 
+    // [FIX] dropped (actual_D & 7) restriction — loader handles any D
     if (blockDim.x != 128) return;
-    if (actual_D <= 0 || actual_D > D_PAD || (actual_D & 7) != 0 || Sq <= 0 || Skv <= 0) return;
+    if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) return;
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -501,7 +528,9 @@ __global__ void flashattn_fwd(
     const int tileid = blockIdx.z;
     const int num_heads = gridDim.y;
 
-    const int kv_headid = headid / (num_heads / numKVheads); // headid for this now depends on this for KV
+    // [FIX] GQA guard
+    if (numKVheads <= 0 || num_heads % numKVheads != 0) return;
+    const int kv_headid = headid / (num_heads / numKVheads);
 
     const long long q_base =
         (static_cast<long long>(batchid) * num_heads + headid) *
@@ -586,41 +615,17 @@ __global__ void flashattn_fwd(
 
     const float scale = 1.0f / sqrtf(static_cast<float>(actual_D));
 
-
     asyncLOAD_2D_TILE<Br, D_PAD, 128>(
-        Qptr,
-        smem_u32_ptr(Qsmem),
-        tid,
-        Q_STRIDE,
-        Sq,
-        actual_D,
-        actual_D,
-        tileid,
-        0
+        Qptr, smem_u32_ptr(Qsmem), tid, Q_STRIDE,
+        Sq, actual_D, actual_D, tileid, 0
     );
-
     asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
-        Kptr,
-        smem_u32_ptr(Ksmem[0]),
-        tid,
-        K_STRIDE,
-        Skv,
-        actual_D,
-        actual_D,
-        0,
-        0
+        Kptr, smem_u32_ptr(Ksmem[0]), tid, K_STRIDE,
+        Skv, actual_D, actual_D, 0, 0
     );
-
     asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
-        Vptr,
-        smem_u32_ptr(Vsmem[0]),
-        tid,
-        V_STRIDE,
-        Skv,
-        actual_D,
-        actual_D,
-        0,
-        0
+        Vptr, smem_u32_ptr(Vsmem[0]), tid, V_STRIDE,
+        Skv, actual_D, actual_D, 0, 0
     );
 
     asm volatile("cp.async.commit_group;\n");
@@ -636,34 +641,17 @@ __global__ void flashattn_fwd(
 
         if (next_kv_tile < kv_tiles_to_process) {
             asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
-                Kptr,
-                smem_u32_ptr(Ksmem[next_stage]),
-                tid,
-                K_STRIDE,
-                Skv,
-                actual_D,
-                actual_D,
-                next_kv_tile,
-                0
+                Kptr, smem_u32_ptr(Ksmem[next_stage]), tid, K_STRIDE,
+                Skv, actual_D, actual_D, next_kv_tile, 0
             );
-
             asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
-                Vptr,
-                smem_u32_ptr(Vsmem[next_stage]),
-                tid,
-                V_STRIDE,
-                Skv,
-                actual_D,
-                actual_D,
-                next_kv_tile,
-                0
+                Vptr, smem_u32_ptr(Vsmem[next_stage]), tid, V_STRIDE,
+                Skv, actual_D, actual_D, next_kv_tile, 0
             );
-
             asm volatile("cp.async.commit_group;\n");
         }
 
         float S_frag[Bk * 4] = {0.0f};
-
 
         const int q_row = warp * 16 + (lane & 15);
         const int lane16 = lane & 15;
@@ -676,9 +664,7 @@ __global__ void flashattn_fwd(
 
             ldmatrix_x4(
                 q_frag,
-                smem_u32_ptr(
-                    Qsmem + q_row * Q_STRIDE + q_col
-                )
+                smem_u32_ptr(Qsmem + q_row * Q_STRIDE + q_col)
             );
 
             #pragma unroll
@@ -753,23 +739,10 @@ __global__ void flashattn_fwd(
                 float max0 = fmaxf(s0, s1);
                 float max1 = fmaxf(s2, s3);
 
-                max0 = fmaxf(
-                    max0,
-                    __shfl_xor_sync(0xffffffffu, max0, 1, 4)
-                );
-                max0 = fmaxf(
-                    max0,
-                    __shfl_xor_sync(0xffffffffu, max0, 2, 4)
-                );
-
-                max1 = fmaxf(
-                    max1,
-                    __shfl_xor_sync(0xffffffffu, max1, 1, 4)
-                );
-                max1 = fmaxf(
-                    max1,
-                    __shfl_xor_sync(0xffffffffu, max1, 2, 4)
-                );
+                max0 = fmaxf(max0, __shfl_xor_sync(0xffffffffu, max0, 1, 4));
+                max0 = fmaxf(max0, __shfl_xor_sync(0xffffffffu, max0, 2, 4));
+                max1 = fmaxf(max1, __shfl_xor_sync(0xffffffffu, max1, 1, 4));
+                max1 = fmaxf(max1, __shfl_xor_sync(0xffffffffu, max1, 2, 4));
 
                 tile_max[0] = fmaxf(tile_max[0], max0);
                 tile_max[1] = fmaxf(tile_max[1], max1);
@@ -821,23 +794,10 @@ __global__ void flashattn_fwd(
                 float max0 = fmaxf(s0, s1);
                 float max1 = fmaxf(s2, s3);
 
-                max0 = fmaxf(
-                    max0,
-                    __shfl_xor_sync(0xffffffffu, max0, 1, 4)
-                );
-                max0 = fmaxf(
-                    max0,
-                    __shfl_xor_sync(0xffffffffu, max0, 2, 4)
-                );
-
-                max1 = fmaxf(
-                    max1,
-                    __shfl_xor_sync(0xffffffffu, max1, 1, 4)
-                );
-                max1 = fmaxf(
-                    max1,
-                    __shfl_xor_sync(0xffffffffu, max1, 2, 4)
-                );
+                max0 = fmaxf(max0, __shfl_xor_sync(0xffffffffu, max0, 1, 4));
+                max0 = fmaxf(max0, __shfl_xor_sync(0xffffffffu, max0, 2, 4));
+                max1 = fmaxf(max1, __shfl_xor_sync(0xffffffffu, max1, 1, 4));
+                max1 = fmaxf(max1, __shfl_xor_sync(0xffffffffu, max1, 2, 4));
 
                 tile_max[0] = fmaxf(tile_max[0], max0);
                 tile_max[1] = fmaxf(tile_max[1], max1);
@@ -852,6 +812,7 @@ __global__ void flashattn_fwd(
         const float alpha0 = __expf(old_max0 - new_max0);
         const float alpha1 = __expf(old_max1 - new_max1);
 
+        #pragma unroll   // [FIX]
         for (int vs = 0; vs < Dv; ++vs) {
             O_frag[vs * 4 + 0] *= alpha0;
             O_frag[vs * 4 + 1] *= alpha0;
@@ -865,25 +826,17 @@ __global__ void flashattn_fwd(
         float tile_sum0 = 0.0f;
         float tile_sum1 = 0.0f;
 
-
+        #pragma unroll   // [FIX]
         for (int kb = 0; kb < Bk; kb += 2) {
-            const float p0 =
-                __expf(S_frag[kb * 4 + 0] - new_max0);
-            const float p1 =
-                __expf(S_frag[kb * 4 + 1] - new_max0);
-            const float p2 =
-                __expf(S_frag[kb * 4 + 2] - new_max1);
-            const float p3 =
-                __expf(S_frag[kb * 4 + 3] - new_max1);
+            const float p0 = __expf(S_frag[kb * 4 + 0] - new_max0);
+            const float p1 = __expf(S_frag[kb * 4 + 1] - new_max0);
+            const float p2 = __expf(S_frag[kb * 4 + 2] - new_max1);
+            const float p3 = __expf(S_frag[kb * 4 + 3] - new_max1);
 
-            const float p4 =
-                __expf(S_frag[(kb + 1) * 4 + 0] - new_max0);
-            const float p5 =
-                __expf(S_frag[(kb + 1) * 4 + 1] - new_max0);
-            const float p6 =
-                __expf(S_frag[(kb + 1) * 4 + 2] - new_max1);
-            const float p7 =
-                __expf(S_frag[(kb + 1) * 4 + 3] - new_max1);
+            const float p4 = __expf(S_frag[(kb + 1) * 4 + 0] - new_max0);
+            const float p5 = __expf(S_frag[(kb + 1) * 4 + 1] - new_max0);
+            const float p6 = __expf(S_frag[(kb + 1) * 4 + 2] - new_max1);
+            const float p7 = __expf(S_frag[(kb + 1) * 4 + 3] - new_max1);
 
             tile_sum0 += p0 + p1 + p4 + p5;
             tile_sum1 += p2 + p3 + p6 + p7;
@@ -897,6 +850,7 @@ __global__ void flashattn_fwd(
             const int v_row =
                 (kb / 2) * 16 + (lane & 15);
 
+            #pragma unroll   // [FIX]
             for (int vs = 0; vs < Dv; ++vs) {
                 uint32_t v_frag[2];
                 const int v_col = vs * 8;
@@ -927,19 +881,10 @@ __global__ void flashattn_fwd(
             }
         }
 
-        tile_sum0 += __shfl_xor_sync(
-            0xffffffffu, tile_sum0, 1, 4
-        );
-        tile_sum0 += __shfl_xor_sync(
-            0xffffffffu, tile_sum0, 2, 4
-        );
-
-        tile_sum1 += __shfl_xor_sync(
-            0xffffffffu, tile_sum1, 1, 4
-        );
-        tile_sum1 += __shfl_xor_sync(
-            0xffffffffu, tile_sum1, 2, 4
-        );
+        tile_sum0 += __shfl_xor_sync(0xffffffffu, tile_sum0, 1, 4);
+        tile_sum0 += __shfl_xor_sync(0xffffffffu, tile_sum0, 2, 4);
+        tile_sum1 += __shfl_xor_sync(0xffffffffu, tile_sum1, 1, 4);
+        tile_sum1 += __shfl_xor_sync(0xffffffffu, tile_sum1, 2, 4);
 
         l_frag[0] = l_frag[0] * alpha0 + tile_sum0;
         l_frag[1] = l_frag[1] * alpha1 + tile_sum1;
@@ -964,33 +909,20 @@ __global__ void flashattn_fwd(
         const int output_col1 = vs * 8 + col1;
 
         if (row0 < Sq && output_col0 < actual_D) {
-            Optr[
-                static_cast<size_t>(row0) * actual_D + output_col0
-            ] = __float2half(
-                O_frag[vs * 4 + 0] * inv_l0
-            );
+            Optr[static_cast<size_t>(row0) * actual_D + output_col0] =
+                __float2half(O_frag[vs * 4 + 0] * inv_l0);
         }
         if (row0 < Sq && output_col1 < actual_D) {
-            Optr[
-                static_cast<size_t>(row0) * actual_D + output_col1
-            ] = __float2half(
-                O_frag[vs * 4 + 1] * inv_l0
-            );
+            Optr[static_cast<size_t>(row0) * actual_D + output_col1] =
+                __float2half(O_frag[vs * 4 + 1] * inv_l0);
         }
-
         if (row1 < Sq && output_col0 < actual_D) {
-            Optr[
-                static_cast<size_t>(row1) * actual_D + output_col0
-            ] = __float2half(
-                O_frag[vs * 4 + 2] * inv_l1
-            );
+            Optr[static_cast<size_t>(row1) * actual_D + output_col0] =
+                __float2half(O_frag[vs * 4 + 2] * inv_l1);
         }
         if (row1 < Sq && output_col1 < actual_D) {
-            Optr[
-                static_cast<size_t>(row1) * actual_D + output_col1
-            ] = __float2half(
-                O_frag[vs * 4 + 3] * inv_l1
-            );
+            Optr[static_cast<size_t>(row1) * actual_D + output_col1] =
+                __float2half(O_frag[vs * 4 + 3] * inv_l1);
         }
     }
 
@@ -1005,10 +937,9 @@ __global__ void flashattn_fwd(
 }
 
 
-
-
-
-
+// ===========================================================================
+// BACKWARD helpers
+// ===========================================================================
 namespace flashattn_masked_bwd_detail {
 
 template<int M, int N, int ACC_COUNT>
@@ -1049,29 +980,26 @@ __device__ __forceinline__ void store_f16(
             const int col1 = col0 + 1;
 
             if (global_row0 < total_rows && col0 < actual_cols) {
-                output[
-                    static_cast<size_t>(global_row0) * actual_cols + col0
-                ] = __float2half(accumulator[slot * 4 + 0]);
+                output[static_cast<size_t>(global_row0) * actual_cols + col0] =
+                    __float2half(accumulator[slot * 4 + 0]);
             }
             if (global_row0 < total_rows && col1 < actual_cols) {
-                output[
-                    static_cast<size_t>(global_row0) * actual_cols + col1
-                ] = __float2half(accumulator[slot * 4 + 1]);
+                output[static_cast<size_t>(global_row0) * actual_cols + col1] =
+                    __float2half(accumulator[slot * 4 + 1]);
             }
             if (global_row1 < total_rows && col0 < actual_cols) {
-                output[
-                    static_cast<size_t>(global_row1) * actual_cols + col0
-                ] = __float2half(accumulator[slot * 4 + 2]);
+                output[static_cast<size_t>(global_row1) * actual_cols + col0] =
+                    __float2half(accumulator[slot * 4 + 2]);
             }
             if (global_row1 < total_rows && col1 < actual_cols) {
-                output[
-                    static_cast<size_t>(global_row1) * actual_cols + col1
-                ] = __float2half(accumulator[slot * 4 + 3]);
+                output[static_cast<size_t>(global_row1) * actual_cols + col1] =
+                    __float2half(accumulator[slot * 4 + 3]);
             }
         }
     }
 }
 
+// Kept for API compatibility; dkdv/dq now use exclusive-ownership store_f16.
 template<int M, int N, int ACC_COUNT>
 __device__ __forceinline__ void accumulate_f16(
     const float (&accumulator)[ACC_COUNT],
@@ -1135,6 +1063,7 @@ __device__ __forceinline__ void accumulate_f16(
 
 } // namespace flashattn_masked_bwd_detail
 
+
 template<int D_PAD>
 __global__ void flashattn_bwd_delta_kernel(
     const __half* __restrict__ O,
@@ -1175,9 +1104,9 @@ __global__ void flashattn_bwd_delta_kernel(
     }
 }
 
-
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void flashattn_bwd_dkdv_kernel(
+__global__ void __launch_bounds__(128)   // [FIX]
+flashattn_bwd_dkdv_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -1199,8 +1128,8 @@ __global__ void flashattn_bwd_dkdv_kernel(
                   "D_PAD must be divisible by 16");
 
     if (blockDim.x != 128) return;
-    if (actual_D <= 0 || actual_D > D_PAD || (actual_D & 7) != 0 ||
-        Sq <= 0 || Skv <= 0) {
+    // [FIX] dropped (actual_D & 7) restriction
+    if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) {
         return;
     }
 
@@ -1213,6 +1142,10 @@ __global__ void flashattn_bwd_dkdv_kernel(
     constexpr int V_STRIDE = D_PAD + PAD;
     constexpr int DO_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
+    // [FIX] p/dS stored transposed [k][q]; padded stride kills the
+    // full-warp single-bank serialization in the elementwise passes and
+    // the multi-way ldmatrix conflicts on the dV/dK A-operand loads.
+    constexpr int PDS_STRIDE = Br + PAD;
 
     constexpr int kOutputTiles = (Bc / 16) * (D_PAD / 8);
     constexpr int kTilesPerWarp = (kOutputTiles + 3) / 4;
@@ -1226,6 +1159,8 @@ __global__ void flashattn_bwd_dkdv_kernel(
     const int kv_tile = blockIdx.z;
     const int heads = gridDim.y;
 
+    // [FIX] GQA guard
+    if (numKVheads <= 0 || heads % numKVheads != 0) return;
     const int kv_headid = head / (heads / numKVheads);
 
     const long long q_base =
@@ -1257,12 +1192,12 @@ __global__ void flashattn_bwd_dkdv_kernel(
         : Skv - 1;
     const bool kv_tile_full = kv_last_unclamped < Skv;
 
+    // [FIX] No early return for causally-dead tiles: they must still run so
+    // their dK/dV rows are STORED AS ZEROS (lets the host use empty_like).
     int first_q_tile = 0;
     if constexpr (masked) {
-        if (kv_start >= Sq) {
-            return;
-        }
         first_q_tile = kv_start / Br;
+        if (first_q_tile > q_tiles) first_q_tile = q_tiles;
     }
 
     extern __shared__ char shared_raw[];
@@ -1303,7 +1238,7 @@ __global__ void flashattn_bwd_dkdv_kernel(
     shared_ptr += Br * S_STRIDE * sizeof(float);
     align_ptr();
     __half* p_ds_smem = reinterpret_cast<__half*>(shared_ptr);
-    shared_ptr += Bc * Br * sizeof(__half);
+    shared_ptr += Bc * PDS_STRIDE * sizeof(__half);   // [FIX] padded
 
     align_ptr();
     float* l_smem = reinterpret_cast<float*>(shared_ptr);
@@ -1311,35 +1246,23 @@ __global__ void flashattn_bwd_dkdv_kernel(
     align_ptr();
     float* delta_smem = reinterpret_cast<float*>(shared_ptr);
 
-    asyncLOAD_2D_TILE<
-        Bc, D_PAD, 128
-    >(
-        Kptr,
-        smem_u32_ptr(smemK),
-        tid, K_STRIDE, Skv, actual_D, actual_D, kv_tile, 0
+    asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+        Kptr, smem_u32_ptr(smemK), tid, K_STRIDE,
+        Skv, actual_D, actual_D, kv_tile, 0
     );
-    asyncLOAD_2D_TILE<
-        Bc, D_PAD, 128
-    >(
-        Vptr,
-        smem_u32_ptr(smemV),
-        tid, V_STRIDE, Skv, actual_D, actual_D, kv_tile, 0
+    asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+        Vptr, smem_u32_ptr(smemV), tid, V_STRIDE,
+        Skv, actual_D, actual_D, kv_tile, 0
     );
     asm volatile("cp.async.commit_group;\n");
 
-    asyncLOAD_2D_TILE<
-        Br, D_PAD, 128
-    >(
-        Qptr,
-        smem_u32_ptr(smemQ[0]),
-        tid, Q_STRIDE, Sq, actual_D, actual_D, first_q_tile, 0
+    asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+        Qptr, smem_u32_ptr(smemQ[0]), tid, Q_STRIDE,
+        Sq, actual_D, actual_D, first_q_tile, 0
     );
-    asyncLOAD_2D_TILE<
-        Br, D_PAD, 128
-    >(
-        dOptr,
-        smem_u32_ptr(smemdO[0]),
-        tid, DO_STRIDE, Sq, actual_D, actual_D, first_q_tile, 0
+    asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+        dOptr, smem_u32_ptr(smemdO[0]), tid, DO_STRIDE,
+        Sq, actual_D, actual_D, first_q_tile, 0
     );
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -1353,25 +1276,13 @@ __global__ void flashattn_bwd_dkdv_kernel(
         const int next_q_tile = q_tile + 1;
 
         if (next_q_tile < q_tiles) {
-            asyncLOAD_2D_TILE<
-                Br, D_PAD, 128
-            >(
-                Qptr,
-                smem_u32_ptr(
-                    smemQ[next_stage]
-                ),
-                tid, Q_STRIDE, Sq, actual_D, actual_D,
-                next_q_tile, 0
+            asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+                Qptr, smem_u32_ptr(smemQ[next_stage]), tid, Q_STRIDE,
+                Sq, actual_D, actual_D, next_q_tile, 0
             );
-            asyncLOAD_2D_TILE<
-                Br, D_PAD, 128
-            >(
-                dOptr,
-                smem_u32_ptr(
-                    smemdO[next_stage]
-                ),
-                tid, DO_STRIDE, Sq, actual_D, actual_D,
-                next_q_tile, 0
+            asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+                dOptr, smem_u32_ptr(smemdO[next_stage]), tid, DO_STRIDE,
+                Sq, actual_D, actual_D, next_q_tile, 0
             );
             asm volatile("cp.async.commit_group;\n");
         }
@@ -1411,7 +1322,7 @@ __global__ void flashattn_bwd_dkdv_kernel(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
-                p_ds_smem[col * Br + row] = __float2half(p);
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);   // [FIX]
             }
         } else {
             #pragma unroll
@@ -1435,16 +1346,14 @@ __global__ void flashattn_bwd_dkdv_kernel(
                         l_smem[row]
                     );
                 }
-                p_ds_smem[col * Br + row] = __float2half(p);
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);   // [FIX]
             }
         }
         __syncthreads();
 
-
         mma_accum_f16_registers<
-            Bc, Br, D_PAD, Br, DO_STRIDE, kAccumulatorCount
+            Bc, Br, D_PAD, PDS_STRIDE, DO_STRIDE, kAccumulatorCount   // [FIX]
         >(p_ds_smem, smemdO[current_stage], dV_fragment);
-
 
         mma_score_f16_tiled<
             Br, D_PAD, Bc, DO_STRIDE, V_STRIDE, S_STRIDE
@@ -1457,11 +1366,11 @@ __global__ void flashattn_bwd_dkdv_kernel(
                 const int row = index / Bc;
                 const int col = index % Bc;
                 const float p =
-                    __half2float(p_ds_smem[col * Br + row]);
+                    __half2float(p_ds_smem[col * PDS_STRIDE + row]);   // [FIX]
                 const float dp = score_smem[row * S_STRIDE + col];
                 const float ds =
                     p * (dp - delta_smem[row]) * scale;
-                p_ds_smem[col * Br + row] = __float2half(ds);
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds);  // [FIX]
             }
         } else {
             #pragma unroll
@@ -1481,18 +1390,17 @@ __global__ void flashattn_bwd_dkdv_kernel(
                 float ds = 0.0f;
                 if (valid) {
                     const float p =
-                        __half2float(p_ds_smem[col * Br + row]);
+                        __half2float(p_ds_smem[col * PDS_STRIDE + row]);  // [FIX]
                     const float dp = score_smem[row * S_STRIDE + col];
                     ds = p * (dp - delta_smem[row]) * scale;
                 }
-                p_ds_smem[col * Br + row] = __float2half(ds);
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds);     // [FIX]
             }
         }
         __syncthreads();
 
-
         mma_accum_f16_registers<
-            Bc, Br, D_PAD, Br, Q_STRIDE, kAccumulatorCount
+            Bc, Br, D_PAD, PDS_STRIDE, Q_STRIDE, kAccumulatorCount   // [FIX]
         >(p_ds_smem, smemQ[current_stage], dK_fragment);
 
         if (next_q_tile < q_tiles) {
@@ -1501,17 +1409,20 @@ __global__ void flashattn_bwd_dkdv_kernel(
         }
     }
 
-    flashattn_masked_bwd_detail::accumulate_f16<
+    // [FIX] Exclusive ownership (this block is the only writer of dK/dV rows
+    // [kv_start, kv_start+Bc)) -> plain stores; dead tiles store zeros.
+    flashattn_masked_bwd_detail::store_f16<
         Bc, D_PAD, kAccumulatorCount
     >(dK_fragment, dKptr, kv_start, Skv, actual_D);
-    flashattn_masked_bwd_detail::accumulate_f16<
+    flashattn_masked_bwd_detail::store_f16<
         Bc, D_PAD, kAccumulatorCount
     >(dV_fragment, dVptr, kv_start, Skv, actual_D);
 }
 
 
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void flashattn_bwd_dq_kernel(
+__global__ void __launch_bounds__(128)   // [FIX]
+flashattn_bwd_dq_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -1532,8 +1443,8 @@ __global__ void flashattn_bwd_dq_kernel(
                   "D_PAD must be divisible by 16");
 
     if (blockDim.x != 128) return;
-    if (actual_D <= 0 || actual_D > D_PAD || (actual_D & 7) != 0 ||
-        Sq <= 0 || Skv <= 0) {
+    // [FIX] dropped (actual_D & 7) restriction
+    if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) {
         return;
     }
 
@@ -1546,6 +1457,9 @@ __global__ void flashattn_bwd_dq_kernel(
     constexpr int V_STRIDE = D_PAD + PAD;
     constexpr int DO_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
+    // [FIX] dS stored [q][k]; padded stride (was raw Bc -> 4-way ldmatrix
+    // conflicts on the dQ A-operand load for Bc=32, 2-way for Bc=16).
+    constexpr int PDS_STRIDE = Bc + PAD;
 
     constexpr int kOutputTiles = (Br / 16) * (D_PAD / 8);
     constexpr int kTilesPerWarp = (kOutputTiles + 3) / 4;
@@ -1557,6 +1471,8 @@ __global__ void flashattn_bwd_dq_kernel(
     const int q_tile = blockIdx.z;
     const int heads = gridDim.y;
 
+    // [FIX] GQA guard
+    if (numKVheads <= 0 || heads % numKVheads != 0) return;
     const int kv_headid = head / (heads / numKVheads);
 
     const long long q_base =
@@ -1633,7 +1549,7 @@ __global__ void flashattn_bwd_dq_kernel(
     shared_ptr += Br * S_STRIDE * sizeof(float);
     align_ptr();
     __half* p_ds_smem = reinterpret_cast<__half*>(shared_ptr);
-    shared_ptr += Br * Bc * sizeof(__half);
+    shared_ptr += Br * PDS_STRIDE * sizeof(__half);   // [FIX] padded
 
     align_ptr();
     float* l_smem = reinterpret_cast<float*>(shared_ptr);
@@ -1641,19 +1557,13 @@ __global__ void flashattn_bwd_dq_kernel(
     align_ptr();
     float* delta_smem = reinterpret_cast<float*>(shared_ptr);
 
-    asyncLOAD_2D_TILE<
-        Br, D_PAD, 128
-    >(
-        Qptr,
-        smem_u32_ptr(smemQ),
-        tid, Q_STRIDE, Sq, actual_D, actual_D, q_tile, 0
+    asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+        Qptr, smem_u32_ptr(smemQ), tid, Q_STRIDE,
+        Sq, actual_D, actual_D, q_tile, 0
     );
-    asyncLOAD_2D_TILE<
-        Br, D_PAD, 128
-    >(
-        dOptr,
-        smem_u32_ptr(smemdO),
-        tid, DO_STRIDE, Sq, actual_D, actual_D, q_tile, 0
+    asyncLOAD_2D_TILE<Br, D_PAD, 128>(
+        dOptr, smem_u32_ptr(smemdO), tid, DO_STRIDE,
+        Sq, actual_D, actual_D, q_tile, 0
     );
     asm volatile("cp.async.commit_group;\n");
 
@@ -1668,19 +1578,13 @@ __global__ void flashattn_bwd_dq_kernel(
         }
     }
 
-    asyncLOAD_2D_TILE<
-        Bc, D_PAD, 128
-    >(
-        Kptr,
-        smem_u32_ptr(smemK[0]),
-        tid, K_STRIDE, Skv, actual_D, actual_D, 0, 0
+    asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+        Kptr, smem_u32_ptr(smemK[0]), tid, K_STRIDE,
+        Skv, actual_D, actual_D, 0, 0
     );
-    asyncLOAD_2D_TILE<
-        Bc, D_PAD, 128
-    >(
-        Vptr,
-        smem_u32_ptr(smemV[0]),
-        tid, V_STRIDE, Skv, actual_D, actual_D, 0, 0
+    asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+        Vptr, smem_u32_ptr(smemV[0]), tid, V_STRIDE,
+        Skv, actual_D, actual_D, 0, 0
     );
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -1692,25 +1596,13 @@ __global__ void flashattn_bwd_dq_kernel(
         const int next_kv_tile = kv_tile + 1;
 
         if (next_kv_tile < kv_tiles_to_process) {
-            asyncLOAD_2D_TILE<
-                Bc, D_PAD, 128
-            >(
-                Kptr,
-                smem_u32_ptr(
-                    smemK[next_stage]
-                ),
-                tid, K_STRIDE, Skv, actual_D, actual_D,
-                next_kv_tile, 0
+            asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+                Kptr, smem_u32_ptr(smemK[next_stage]), tid, K_STRIDE,
+                Skv, actual_D, actual_D, next_kv_tile, 0
             );
-            asyncLOAD_2D_TILE<
-                Bc, D_PAD, 128
-            >(
-                Vptr,
-                smem_u32_ptr(
-                    smemV[next_stage]
-                ),
-                tid, V_STRIDE, Skv, actual_D, actual_D,
-                next_kv_tile, 0
+            asyncLOAD_2D_TILE<Bc, D_PAD, 128>(
+                Vptr, smem_u32_ptr(smemV[next_stage]), tid, V_STRIDE,
+                Skv, actual_D, actual_D, next_kv_tile, 0
             );
             asm volatile("cp.async.commit_group;\n");
         }
@@ -1743,7 +1635,7 @@ __global__ void flashattn_bwd_dq_kernel(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
-                p_ds_smem[row * Bc + col] = __float2half(p);
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);   // [FIX]
             }
         } else {
             #pragma unroll
@@ -1767,11 +1659,10 @@ __global__ void flashattn_bwd_dq_kernel(
                         l_smem[row]
                     );
                 }
-                p_ds_smem[row * Bc + col] = __float2half(p);
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);   // [FIX]
             }
         }
         __syncthreads();
-
 
         mma_score_f16_tiled<
             Br, D_PAD, Bc, DO_STRIDE, V_STRIDE, S_STRIDE
@@ -1784,11 +1675,11 @@ __global__ void flashattn_bwd_dq_kernel(
                 const int row = index / Bc;
                 const int col = index % Bc;
                 const float p =
-                    __half2float(p_ds_smem[row * Bc + col]);
+                    __half2float(p_ds_smem[row * PDS_STRIDE + col]);   // [FIX]
                 const float dp = score_smem[row * S_STRIDE + col];
                 const float ds =
                     p * (dp - delta_smem[row]) * scale;
-                p_ds_smem[row * Bc + col] = __float2half(ds);
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds);  // [FIX]
             }
         } else {
             #pragma unroll
@@ -1808,18 +1699,17 @@ __global__ void flashattn_bwd_dq_kernel(
                 float ds = 0.0f;
                 if (valid) {
                     const float p =
-                        __half2float(p_ds_smem[row * Bc + col]);
+                        __half2float(p_ds_smem[row * PDS_STRIDE + col]);  // [FIX]
                     const float dp = score_smem[row * S_STRIDE + col];
                     ds = p * (dp - delta_smem[row]) * scale;
                 }
-                p_ds_smem[row * Bc + col] = __float2half(ds);
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds);     // [FIX]
             }
         }
         __syncthreads();
 
-
         mma_accum_f16_registers<
-            Br, Bc, D_PAD, Bc, K_STRIDE, kAccumulatorCount
+            Br, Bc, D_PAD, PDS_STRIDE, K_STRIDE, kAccumulatorCount   // [FIX]
         >(p_ds_smem, smemK[current_stage], dQ_fragment);
 
         if (next_kv_tile < kv_tiles_to_process) {
@@ -1828,16 +1718,19 @@ __global__ void flashattn_bwd_dq_kernel(
         }
     }
 
+    // [FIX] Exclusive ownership: one block per q-tile -> plain store.
     flashattn_masked_bwd_detail::store_f16<
         Br, D_PAD, kAccumulatorCount
     >(dQ_fragment, dQptr, q_start, Sq, actual_D);
 }
+
 
 template<int Br, int Bc, int D_PAD>
 constexpr size_t flashattn_bwd_dkdv_smem_bytes() {
     constexpr int PAD = 8;
     constexpr int D_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
+    constexpr int PDS_STRIDE = Br + PAD;   // [FIX] must match the kernel
 
     return
         2 * Br * D_STRIDE * sizeof(__half) +
@@ -1845,7 +1738,7 @@ constexpr size_t flashattn_bwd_dkdv_smem_bytes() {
         Bc * D_STRIDE * sizeof(__half) +
         Bc * D_STRIDE * sizeof(__half) +
         Br * S_STRIDE * sizeof(float) +
-        Bc * Br * sizeof(__half) +
+        Bc * PDS_STRIDE * sizeof(__half) +   // [FIX] was Bc * Br
         2 * Br * sizeof(float) +
         256;
 }
@@ -1855,6 +1748,7 @@ constexpr size_t flashattn_bwd_dq_smem_bytes() {
     constexpr int PAD = 8;
     constexpr int D_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
+    constexpr int PDS_STRIDE = Bc + PAD;   // [FIX] must match the kernel
 
     return
         Br * D_STRIDE * sizeof(__half) +
@@ -1862,13 +1756,14 @@ constexpr size_t flashattn_bwd_dq_smem_bytes() {
         2 * Bc * D_STRIDE * sizeof(__half) +
         2 * Bc * D_STRIDE * sizeof(__half) +
         Br * S_STRIDE * sizeof(float) +
-        Br * Bc * sizeof(__half) +
+        Br * PDS_STRIDE * sizeof(__half) +   // [FIX] was Br * Bc
         2 * Br * sizeof(float) +
         256;
 }
 
 
-#endif
+#endif  // FLASHATTN_MASKED_SINGLE_FILE_CUH
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -1917,10 +1812,14 @@ static void check_qkv(
     TORCH_CHECK(Q.size(3) == V.size(3), "Q and V head dimensions must match");
     TORCH_CHECK(Q.size(0) > 0, "B must be positive");
     TORCH_CHECK(Q.size(1) > 0, "H must be positive");
+    // outputs silently unwritten
+    TORCH_CHECK(K.size(1) > 0, "H_kv must be positive");
+    TORCH_CHECK(K.size(1) <= Q.size(1), "H_kv must be <= H");
+    TORCH_CHECK(Q.size(1) % K.size(1) == 0,
+                "H must be divisible by H_kv (GQA)");
     TORCH_CHECK(Q.size(2) > 0, "Sq must be positive");
     TORCH_CHECK(K.size(2) > 0, "Skv must be positive");
     TORCH_CHECK(Q.size(3) > 0, "D must be positive");
-    TORCH_CHECK((Q.size(3) & 7) == 0, "D must be divisible by 8");
     TORCH_CHECK(Q.size(3) <= 256, "D must be <= 256");
     TORCH_CHECK(Q.size(0) <= std::numeric_limits<int>::max(), "B is too large");
     TORCH_CHECK(Q.size(1) <= 65535, "H is too large");
@@ -2060,8 +1959,13 @@ static std::vector<torch::Tensor> launch_bwd_impl(
     TORCH_CHECK((Sq + Br - 1) / Br <= 65535, "Sq requires too many backward tiles");
 
     auto dQ = torch::empty_like(Q);
-    auto dK = torch::zeros_like(K);
-    auto dV = torch::zeros_like(V);
+    // [FIX] zeros_like -> empty_like: kernels now use exclusive-ownership
+    // plain stores covering EVERY element (causally-dead kv tiles store
+    // zeros themselves). Saves two full memsets per backward call.
+    // NOTE: only valid with the store_f16 scheme; if you switch back to
+    // accumulate_f16 (atomics), restore zeros_like.
+    auto dK = torch::empty_like(K);
+    auto dV = torch::empty_like(V);
     auto Delta = torch::empty(
         {Q.size(0), Q.size(1), Q.size(2)},
         Q.options().dtype(torch::kFloat32)
@@ -2153,6 +2057,7 @@ static std::vector<torch::Tensor> dispatch_bwd(
     const torch::Tensor& dO,
     const torch::Tensor& L
 ) {
+    // Tile table kept as-is (existing occupancy tuning). See perf knobs note.
     switch (d_pad) {
         case 32: return launch_bwd_impl<32, 32, 32, Masked>(Q, K, V, O, dO, L);
         case 64: return launch_bwd_impl<32, 32, 64, Masked>(Q, K, V, O, dO, L);
