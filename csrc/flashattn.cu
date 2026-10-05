@@ -492,9 +492,6 @@ __device__ __forceinline__ void store_f16_registers(
 #endif  // MMA_HELPERS_CUH
 
 
-// ===========================================================================
-// FORWARD
-// ===========================================================================
 template<int Br, int Bc, int D_PAD, bool masked>
 __global__ void __launch_bounds__(128)   // [FIX]
 flashattn_fwd(
@@ -937,9 +934,6 @@ flashattn_fwd(
 }
 
 
-// ===========================================================================
-// BACKWARD helpers
-// ===========================================================================
 namespace flashattn_masked_bwd_detail {
 
 template<int M, int N, int ACC_COUNT>
@@ -999,7 +993,6 @@ __device__ __forceinline__ void store_f16(
     }
 }
 
-// Kept for API compatibility; dkdv/dq now use exclusive-ownership store_f16.
 template<int M, int N, int ACC_COUNT>
 __device__ __forceinline__ void accumulate_f16(
     const float (&accumulator)[ACC_COUNT],
@@ -1409,8 +1402,6 @@ flashattn_bwd_dkdv_kernel(
         }
     }
 
-    // [FIX] Exclusive ownership (this block is the only writer of dK/dV rows
-    // [kv_start, kv_start+Bc)) -> plain stores; dead tiles store zeros.
     flashattn_masked_bwd_detail::store_f16<
         Bc, D_PAD, kAccumulatorCount
     >(dK_fragment, dKptr, kv_start, Skv, actual_D);
@@ -1457,8 +1448,7 @@ flashattn_bwd_dq_kernel(
     constexpr int V_STRIDE = D_PAD + PAD;
     constexpr int DO_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
-    // [FIX] dS stored [q][k]; padded stride (was raw Bc -> 4-way ldmatrix
-    // conflicts on the dQ A-operand load for Bc=32, 2-way for Bc=16).
+
     constexpr int PDS_STRIDE = Bc + PAD;
 
     constexpr int kOutputTiles = (Br / 16) * (D_PAD / 8);
@@ -1718,7 +1708,6 @@ flashattn_bwd_dq_kernel(
         }
     }
 
-    // [FIX] Exclusive ownership: one block per q-tile -> plain store.
     flashattn_masked_bwd_detail::store_f16<
         Br, D_PAD, kAccumulatorCount
     >(dQ_fragment, dQptr, q_start, Sq, actual_D);
@@ -1959,11 +1948,7 @@ static std::vector<torch::Tensor> launch_bwd_impl(
     TORCH_CHECK((Sq + Br - 1) / Br <= 65535, "Sq requires too many backward tiles");
 
     auto dQ = torch::empty_like(Q);
-    // [FIX] zeros_like -> empty_like: kernels now use exclusive-ownership
-    // plain stores covering EVERY element (causally-dead kv tiles store
-    // zeros themselves). Saves two full memsets per backward call.
-    // NOTE: only valid with the store_f16 scheme; if you switch back to
-    // accumulate_f16 (atomics), restore zeros_like.
+   
     auto dK = torch::empty_like(K);
     auto dV = torch::empty_like(V);
     auto Delta = torch::empty(
