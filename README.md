@@ -13,8 +13,8 @@ Requirements:
 - Python 3.9+ and PyTorch 2.1+ with CUDA support (tested: Python 3.10, PyTorch 2.7.1+cu118, CUDA 11.8)
 
 ```bash
-git clone https://github.com/<you>/flash-attention-scratch.git
-cd flash-attention-scratch
+https://github.com/akshay919191/flashattn-V1
+cd flashattn-V1
 pip install -e . --no-build-isolation
 ```
 
