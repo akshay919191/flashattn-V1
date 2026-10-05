@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-acc-reg"
+dynamic = ["version"]
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.dynamic]
+version = { attr = "flash_acc_reg.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]   

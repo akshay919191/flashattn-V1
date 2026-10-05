@@ -43,3 +43,42 @@ env/
 
 # OS junk
 .DS_Store
+
+# Extension build leftovers
+.eggs/
+*.egg
+.ninja_deps
+.ninja_log
+build.ninja
+
+# PyTorch JIT cache (only appears in the repo if you set TORCH_EXTENSIONS_DIR to a local path)
+.torch_extensions/
+torch_extensions/
+
+# More CUDA intermediates (appear with -keep or when debugging)
+*.ii
+*.cudafe1.*
+*.module_id
+*.fatbin.c
+
+# Crash dumps
+core
+core.[0-9]*
+
+# Local config and secrets
+.env
+.env.*
+
+# Other OS/editor junk
+Thumbs.db
+*.swp
+*~
+.idea/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Benchmark output (uncomment if you save results locally)
+# *.csv
+# results/
