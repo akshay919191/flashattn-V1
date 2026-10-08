@@ -76,12 +76,6 @@ __device__ __forceinline__ uint32_t get_smem_ptr(const void* ptr, int row, int c
     return smem_u32_ptr(reinterpret_cast<const __half*>(ptr) + r * stride + c);
 }
 
-// ---------------------------------------------------------------------------
-// [FIX] Loads a Rows x Cols half tile into smem with cp.async, zero-padding
-// OOB rows/cols. Fast path: 16B-aligned gmem rows (global_stride % 8 == 0)
-// with a tail-fixup for total_cols % 8 != 0. Scalar fallback otherwise.
-// Supports ANY total_cols in [1, Cols]. (Signature unchanged.)
-// ---------------------------------------------------------------------------
 template<int Rows, int Cols, int blockdim>
 __device__ __forceinline__ void asyncLOAD_2D_TILE(
     const __half* matrix,
@@ -153,7 +147,6 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
             }
         }
     } else {
-        // [FIX] scalar fallback: gmem rows not 16B-aligned (actual_D % 8 != 0)
         for (int i = tid; i < Rows * Cols; i += blockdim) {
             const int lr = i / Cols;
             const int lc = i % Cols;
@@ -493,7 +486,7 @@ __device__ __forceinline__ void store_f16_registers(
 
 
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void __launch_bounds__(128)   // [FIX]
+__global__ void __launch_bounds__(128)   
 flashattn_fwd(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -511,7 +504,6 @@ flashattn_fwd(
     static_assert(D_PAD > 0 && D_PAD % 16 == 0,
                   "D_PAD must be positive and divisible by 16");
 
-    // [FIX] dropped (actual_D & 7) restriction — loader handles any D
     if (blockDim.x != 128) return;
     if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) return;
 
@@ -525,7 +517,6 @@ flashattn_fwd(
     const int tileid = blockIdx.z;
     const int num_heads = gridDim.y;
 
-    // [FIX] GQA guard
     if (numKVheads <= 0 || num_heads % numKVheads != 0) return;
     const int kv_headid = headid / (num_heads / numKVheads);
 
@@ -809,7 +800,7 @@ flashattn_fwd(
         const float alpha0 = __expf(old_max0 - new_max0);
         const float alpha1 = __expf(old_max1 - new_max1);
 
-        #pragma unroll   // [FIX]
+        #pragma unroll   
         for (int vs = 0; vs < Dv; ++vs) {
             O_frag[vs * 4 + 0] *= alpha0;
             O_frag[vs * 4 + 1] *= alpha0;
@@ -823,7 +814,7 @@ flashattn_fwd(
         float tile_sum0 = 0.0f;
         float tile_sum1 = 0.0f;
 
-        #pragma unroll   // [FIX]
+        #pragma unroll   // 
         for (int kb = 0; kb < Bk; kb += 2) {
             const float p0 = __expf(S_frag[kb * 4 + 0] - new_max0);
             const float p1 = __expf(S_frag[kb * 4 + 1] - new_max0);
@@ -847,7 +838,7 @@ flashattn_fwd(
             const int v_row =
                 (kb / 2) * 16 + (lane & 15);
 
-            #pragma unroll   // [FIX]
+            #pragma unroll   
             for (int vs = 0; vs < Dv; ++vs) {
                 uint32_t v_frag[2];
                 const int v_col = vs * 8;
@@ -1098,7 +1089,7 @@ __global__ void flashattn_bwd_delta_kernel(
 }
 
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void __launch_bounds__(128)   // [FIX]
+__global__ void __launch_bounds__(128)   
 flashattn_bwd_dkdv_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -1121,7 +1112,6 @@ flashattn_bwd_dkdv_kernel(
                   "D_PAD must be divisible by 16");
 
     if (blockDim.x != 128) return;
-    // [FIX] dropped (actual_D & 7) restriction
     if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) {
         return;
     }
@@ -1135,9 +1125,7 @@ flashattn_bwd_dkdv_kernel(
     constexpr int V_STRIDE = D_PAD + PAD;
     constexpr int DO_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
-    // [FIX] p/dS stored transposed [k][q]; padded stride kills the
-    // full-warp single-bank serialization in the elementwise passes and
-    // the multi-way ldmatrix conflicts on the dV/dK A-operand loads.
+
     constexpr int PDS_STRIDE = Br + PAD;
 
     constexpr int kOutputTiles = (Bc / 16) * (D_PAD / 8);
@@ -1152,7 +1140,6 @@ flashattn_bwd_dkdv_kernel(
     const int kv_tile = blockIdx.z;
     const int heads = gridDim.y;
 
-    // [FIX] GQA guard
     if (numKVheads <= 0 || heads % numKVheads != 0) return;
     const int kv_headid = head / (heads / numKVheads);
 
@@ -1184,9 +1171,6 @@ flashattn_bwd_dkdv_kernel(
         ? kv_last_unclamped
         : Skv - 1;
     const bool kv_tile_full = kv_last_unclamped < Skv;
-
-    // [FIX] No early return for causally-dead tiles: they must still run so
-    // their dK/dV rows are STORED AS ZEROS (lets the host use empty_like).
     int first_q_tile = 0;
     if constexpr (masked) {
         first_q_tile = kv_start / Br;
@@ -1231,7 +1215,7 @@ flashattn_bwd_dkdv_kernel(
     shared_ptr += Br * S_STRIDE * sizeof(float);
     align_ptr();
     __half* p_ds_smem = reinterpret_cast<__half*>(shared_ptr);
-    shared_ptr += Bc * PDS_STRIDE * sizeof(__half);   // [FIX] padded
+    shared_ptr += Bc * PDS_STRIDE * sizeof(__half);  
 
     align_ptr();
     float* l_smem = reinterpret_cast<float*>(shared_ptr);
@@ -1315,7 +1299,7 @@ flashattn_bwd_dkdv_kernel(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
-                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);   // [FIX]
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);   
             }
         } else {
             #pragma unroll
@@ -1339,13 +1323,13 @@ flashattn_bwd_dkdv_kernel(
                         l_smem[row]
                     );
                 }
-                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);   // [FIX]
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(p);  
             }
         }
         __syncthreads();
 
         mma_accum_f16_registers<
-            Bc, Br, D_PAD, PDS_STRIDE, DO_STRIDE, kAccumulatorCount   // [FIX]
+            Bc, Br, D_PAD, PDS_STRIDE, DO_STRIDE, kAccumulatorCount  
         >(p_ds_smem, smemdO[current_stage], dV_fragment);
 
         mma_score_f16_tiled<
@@ -1359,11 +1343,11 @@ flashattn_bwd_dkdv_kernel(
                 const int row = index / Bc;
                 const int col = index % Bc;
                 const float p =
-                    __half2float(p_ds_smem[col * PDS_STRIDE + row]);   // [FIX]
+                    __half2float(p_ds_smem[col * PDS_STRIDE + row]);   
                 const float dp = score_smem[row * S_STRIDE + col];
                 const float ds =
                     p * (dp - delta_smem[row]) * scale;
-                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds);  // [FIX]
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds); 
             }
         } else {
             #pragma unroll
@@ -1383,17 +1367,17 @@ flashattn_bwd_dkdv_kernel(
                 float ds = 0.0f;
                 if (valid) {
                     const float p =
-                        __half2float(p_ds_smem[col * PDS_STRIDE + row]);  // [FIX]
+                        __half2float(p_ds_smem[col * PDS_STRIDE + row]);  
                     const float dp = score_smem[row * S_STRIDE + col];
                     ds = p * (dp - delta_smem[row]) * scale;
                 }
-                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds);     // [FIX]
+                p_ds_smem[col * PDS_STRIDE + row] = __float2half(ds);     //
             }
         }
         __syncthreads();
 
         mma_accum_f16_registers<
-            Bc, Br, D_PAD, PDS_STRIDE, Q_STRIDE, kAccumulatorCount   // [FIX]
+            Bc, Br, D_PAD, PDS_STRIDE, Q_STRIDE, kAccumulatorCount   
         >(p_ds_smem, smemQ[current_stage], dK_fragment);
 
         if (next_q_tile < q_tiles) {
@@ -1412,7 +1396,7 @@ flashattn_bwd_dkdv_kernel(
 
 
 template<int Br, int Bc, int D_PAD, bool masked>
-__global__ void __launch_bounds__(128)   // [FIX]
+__global__ void __launch_bounds__(128)  
 flashattn_bwd_dq_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -1434,7 +1418,6 @@ flashattn_bwd_dq_kernel(
                   "D_PAD must be divisible by 16");
 
     if (blockDim.x != 128) return;
-    // [FIX] dropped (actual_D & 7) restriction
     if (actual_D <= 0 || actual_D > D_PAD || Sq <= 0 || Skv <= 0) {
         return;
     }
@@ -1461,7 +1444,6 @@ flashattn_bwd_dq_kernel(
     const int q_tile = blockIdx.z;
     const int heads = gridDim.y;
 
-    // [FIX] GQA guard
     if (numKVheads <= 0 || heads % numKVheads != 0) return;
     const int kv_headid = head / (heads / numKVheads);
 
@@ -1539,7 +1521,7 @@ flashattn_bwd_dq_kernel(
     shared_ptr += Br * S_STRIDE * sizeof(float);
     align_ptr();
     __half* p_ds_smem = reinterpret_cast<__half*>(shared_ptr);
-    shared_ptr += Br * PDS_STRIDE * sizeof(__half);   // [FIX] padded
+    shared_ptr += Br * PDS_STRIDE * sizeof(__half);   
 
     align_ptr();
     float* l_smem = reinterpret_cast<float*>(shared_ptr);
@@ -1625,7 +1607,7 @@ flashattn_bwd_dq_kernel(
                     score_smem[row * S_STRIDE + col] * scale -
                     l_smem[row]
                 );
-                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);   // [FIX]
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);  
             }
         } else {
             #pragma unroll
@@ -1649,7 +1631,7 @@ flashattn_bwd_dq_kernel(
                         l_smem[row]
                     );
                 }
-                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);   // [FIX]
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(p);  
             }
         }
         __syncthreads();
@@ -1665,11 +1647,11 @@ flashattn_bwd_dq_kernel(
                 const int row = index / Bc;
                 const int col = index % Bc;
                 const float p =
-                    __half2float(p_ds_smem[row * PDS_STRIDE + col]);   // [FIX]
+                    __half2float(p_ds_smem[row * PDS_STRIDE + col]);  
                 const float dp = score_smem[row * S_STRIDE + col];
                 const float ds =
                     p * (dp - delta_smem[row]) * scale;
-                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds);  // [FIX]
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds); 
             }
         } else {
             #pragma unroll
@@ -1689,17 +1671,17 @@ flashattn_bwd_dq_kernel(
                 float ds = 0.0f;
                 if (valid) {
                     const float p =
-                        __half2float(p_ds_smem[row * PDS_STRIDE + col]);  // [FIX]
+                        __half2float(p_ds_smem[row * PDS_STRIDE + col]); 
                     const float dp = score_smem[row * S_STRIDE + col];
                     ds = p * (dp - delta_smem[row]) * scale;
                 }
-                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds);     // [FIX]
+                p_ds_smem[row * PDS_STRIDE + col] = __float2half(ds);   
             }
         }
         __syncthreads();
 
         mma_accum_f16_registers<
-            Br, Bc, D_PAD, PDS_STRIDE, K_STRIDE, kAccumulatorCount   // [FIX]
+            Br, Bc, D_PAD, PDS_STRIDE, K_STRIDE, kAccumulatorCount  
         >(p_ds_smem, smemK[current_stage], dQ_fragment);
 
         if (next_kv_tile < kv_tiles_to_process) {
@@ -1719,7 +1701,7 @@ constexpr size_t flashattn_bwd_dkdv_smem_bytes() {
     constexpr int PAD = 8;
     constexpr int D_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
-    constexpr int PDS_STRIDE = Br + PAD;   // [FIX] must match the kernel
+    constexpr int PDS_STRIDE = Br + PAD;   
 
     return
         2 * Br * D_STRIDE * sizeof(__half) +
@@ -1727,7 +1709,7 @@ constexpr size_t flashattn_bwd_dkdv_smem_bytes() {
         Bc * D_STRIDE * sizeof(__half) +
         Bc * D_STRIDE * sizeof(__half) +
         Br * S_STRIDE * sizeof(float) +
-        Bc * PDS_STRIDE * sizeof(__half) +   // [FIX] was Bc * Br
+        Bc * PDS_STRIDE * sizeof(__half) + 
         2 * Br * sizeof(float) +
         256;
 }
@@ -1737,7 +1719,7 @@ constexpr size_t flashattn_bwd_dq_smem_bytes() {
     constexpr int PAD = 8;
     constexpr int D_STRIDE = D_PAD + PAD;
     constexpr int S_STRIDE = Bc + PAD;
-    constexpr int PDS_STRIDE = Bc + PAD;   // [FIX] must match the kernel
+    constexpr int PDS_STRIDE = Bc + PAD;  
 
     return
         Br * D_STRIDE * sizeof(__half) +
@@ -1745,7 +1727,7 @@ constexpr size_t flashattn_bwd_dq_smem_bytes() {
         2 * Bc * D_STRIDE * sizeof(__half) +
         2 * Bc * D_STRIDE * sizeof(__half) +
         Br * S_STRIDE * sizeof(float) +
-        Br * PDS_STRIDE * sizeof(__half) +   // [FIX] was Br * Bc
+        Br * PDS_STRIDE * sizeof(__half) +  
         2 * Br * sizeof(float) +
         256;
 }
