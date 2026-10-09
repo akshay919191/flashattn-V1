@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import flash_acc_reg_ext as ext
+from flash_acc_reg import _C as ext
 
 
 def _call(fn, *args, causal):

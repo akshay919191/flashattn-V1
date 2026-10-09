@@ -1,130 +1,490 @@
-"""Backward benchmark: flash_acc_reg_ext.flash_bwd vs torch SDPA backward.
+import argparse
+import csv
+import os
+import sys
 
-Only the backward pass is timed for both (forward is run once outside the timed region).
-
-Examples:
-  python bench_bwd.py
-  python bench_bwd.py --dims 64 128 256 --seqlens 1024 4096 --causal true
-  python bench_bwd.py --sdpa-backend flash --csv bwd.csv
-"""
-import argparse, csv
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+)
+
 import flash_acc_reg_ext as ext
 
 
-def _call(fn, *args, causal):
-    """Your Python binding may or may not expose `causal`; try kwarg, then positional, then omit (non-causal only)."""
-    try:
-        return fn(*args, causal=causal)
-    except TypeError:
-        pass
-    try:
-        return fn(*args, causal)
-    except TypeError:
-        if causal:
-            raise RuntimeError("flash_fwd/flash_bwd binding has no `causal` argument")
-        return fn(*args)
+# ------------------------------------------------------------
+# Your new API
+# ------------------------------------------------------------
+
+def flash_fwd(q, k, v, causal):
+    return ext.flash_fwd(q, k, v, causal)
 
 
-def fwd_raw(q, k, v, causal):          # -> (O, L)
-    return _call(ext.flash_fwd, q, k, v, causal=causal)
+def flash_bwd(q, k, v, o, do, L, causal):
+    return ext.flash_bwd(
+        q,
+        k,
+        v,
+        o,
+        do,
+        L,
+        causal,
+    )
 
 
-def bwd_raw(q, k, v, o, do, L, causal):  # -> (dQ, dK, dV)
-    return _call(ext.flash_bwd, q, k, v, o, do, L, causal=causal)
+# ------------------------------------------------------------
+# Timing
+# ------------------------------------------------------------
 
-BACKENDS = {"auto": None, "flash": SDPBackend.FLASH_ATTENTION,
-            "efficient": SDPBackend.EFFICIENT_ATTENTION, "math": SDPBackend.MATH}
-DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+def time_ms(fn, warmup=10, iters=50):
 
-
-def time_ms(fn, warmup, iters):
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
-    for s, e in zip(starts, ends):
-        cache.zero_()
-        s.record(); fn(); e.record()
-    torch.cuda.synchronize()
-    ts = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    return ts[len(ts) // 2]
 
+    torch.cuda.synchronize()
+
+    times = []
+
+    for _ in range(iters):
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+
+        fn()
+
+        end.record()
+
+        end.synchronize()
+
+        times.append(
+            start.elapsed_time(end)
+        )
+
+    times.sort()
+
+    return times[len(times) // 2]
+
+
+# ------------------------------------------------------------
+# Backward FLOPs
+# ------------------------------------------------------------
 
 def bwd_flops(B, H, N, D, causal):
-    f = 10.0 * B * H * N * N * D  # 2.5x forward (4*B*H*N^2*D)
-    return f * 0.5 if causal else f
 
+    flops = 10.0 * B * H * N * N * D
+
+    if causal:
+        flops *= 0.5
+
+    return flops
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 
 def main():
+
     p = argparse.ArgumentParser()
-    p.add_argument("--dims", type=int, nargs="+", default=[32, 64, 96, 128, 192, 256])
-    p.add_argument("--seqlens", type=int, nargs="+", default=[128, 256, 512, 1024, 2048, 4096])
-    p.add_argument("--causal", choices=["false", "true", "both"], default="both")
-    p.add_argument("--heads", type=int, default=16)
-    p.add_argument("--tokens", type=int, default=16384)
-    p.add_argument("--dtype", choices=DTYPES, default="fp16")
-    p.add_argument("--sdpa-backend", choices=BACKENDS, default="auto")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=50)
-    p.add_argument("--csv", type=str, default=None)
-    a = p.parse_args()
 
-    assert all(d % 8 == 0 and 0 < d <= 256 for d in a.dims), "head dims must be multiples of 8 and <= 256"
-    assert all(0 < n <= 4096 for n in a.seqlens), "seqlen must be <= 4096"
-    dtype = DTYPES[a.dtype]
-    causals = {"false": [False], "true": [True], "both": [False, True]}[a.causal]
-    backend = BACKENDS[a.sdpa_backend]
+    p.add_argument(
+        "--dims",
+        type=int,
+        nargs="+",
+        default=[64, 128],
+    )
 
-    print(f"GPU: {torch.cuda.get_device_name()} | dtype={a.dtype} | sdpa backend={a.sdpa_backend}")
-    hdr = f"{'D':>4} {'N':>5} {'B':>3} {'causal':>6} | {'ext ms':>8} {'TFLOPs':>7} | {'sdpa ms':>8} {'TFLOPs':>7} | {'speedup':>7}"
-    print(hdr); print("-" * len(hdr))
+    p.add_argument(
+        "--seqlens",
+        type=int,
+        nargs="+",
+        default=[1024, 2048, 4096],
+    )
+
+    p.add_argument(
+        "--batch",
+        type=int,
+        nargs="+",
+        default=[1, 2],
+    )
+
+    p.add_argument(
+        "--heads",
+        type=int,
+        default=16,
+    )
+
+    p.add_argument(
+        "--dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+    )
+
+    p.add_argument(
+        "--causal",
+        choices=["false", "true", "both"],
+        default="both",
+    )
+
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=50,
+    )
+
+    p.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+    )
+
+    args = p.parse_args()
+
+    assert torch.cuda.is_available()
+
+    if args.dtype == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16
+
+    if args.causal == "false":
+        causals = [False]
+    elif args.causal == "true":
+        causals = [True]
+    else:
+        causals = [False, True]
+
+
+    # --------------------------------------------------------
+    # Header
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 110)
+    print("CUSTOM FLASH BACKWARD vs PYTORCH SDPA FLASH BACKEND")
+    print("=" * 110)
+
+    print("GPU     :", torch.cuda.get_device_name())
+    print("PyTorch :", torch.__version__)
+    print("CUDA    :", torch.version.cuda)
+    print("dtype   :", args.dtype)
+    print("heads   :", args.heads)
+
+    print("=" * 110)
+
+    header = (
+        f"{'B':>3} "
+        f"{'H':>3} "
+        f"{'N':>6} "
+        f"{'D':>4} "
+        f"{'Causal':>6} | "
+        f"{'Custom ms':>11} "
+        f"{'Custom TF':>10} | "
+        f"{'SDPA ms':>10} "
+        f"{'SDPA TF':>10} | "
+        f"{'Speedup':>8}"
+    )
+
+    print(header)
+    print("-" * len(header))
+
+
     rows = []
-    for causal in causals:
-        for D in a.dims:
-            for N in a.seqlens:
-                B = max(1, a.tokens // N); H = a.heads
-                q, k, v, do = (torch.randn(B, H, N, D, device="cuda", dtype=dtype) for _ in range(4))
 
-                # --- extension: forward once to get O, L ---
-                o, L = fwd_raw(q, k, v, causal)[:2]
-                f_ext = lambda: bwd_raw(q, k, v, o, do, L, causal)
 
-                # --- sdpa: build graph once, time only autograd.grad ---
-                qs, ks, vs = [t.clone().requires_grad_() for t in (q, k, v)]
-                if backend is None:
-                    os_ = F.scaled_dot_product_attention(qs, ks, vs, is_causal=causal)
-                else:
-                    with sdpa_kernel(backend):
-                        os_ = F.scaled_dot_product_attention(qs, ks, vs, is_causal=causal)
+    # --------------------------------------------------------
+    # Benchmark
+    # --------------------------------------------------------
 
-                def f_sdpa():
-                    return torch.autograd.grad(os_, (qs, ks, vs), do, retain_graph=True)
+    for B in args.batch:
 
-                try:
-                    t_e = time_ms(f_ext, a.warmup, a.iters)
-                except Exception as ex:
-                    print(f"{D:>4} {N:>5} {B:>3} {str(causal):>6} | ext failed: {ex}"); continue
-                try:
-                    t_s = time_ms(f_sdpa, a.warmup, a.iters)
-                except Exception:
-                    t_s = float("nan")
-                fl = bwd_flops(B, H, N, D, causal)
-                tf_e, tf_s = fl / t_e / 1e9, fl / t_s / 1e9
-                print(f"{D:>4} {N:>5} {B:>3} {str(causal):>6} | {t_e:8.3f} {tf_e:7.1f} | {t_s:8.3f} {tf_s:7.1f} | {t_s / t_e:6.2f}x")
-                rows.append([D, N, B, H, causal, t_e, tf_e, t_s, tf_s, t_s / t_e])
-                del q, k, v, do, o, L, qs, ks, vs, os_
-    if a.csv:
-        with open(a.csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["D", "N", "B", "H", "causal", "ext_ms", "ext_tflops", "sdpa_ms", "sdpa_tflops", "speedup"])
-            w.writerows(rows)
+        for H in [args.heads]:
+
+            for N in args.seqlens:
+
+                for D in args.dims:
+
+                    for causal in causals:
+
+                        print(
+                            f"Testing "
+                            f"B={B} H={H} "
+                            f"N={N} D={D} "
+                            f"causal={causal} ...",
+                            end="\r",
+                            flush=True,
+                        )
+
+                        try:
+
+                            # ------------------------------------------------
+                            # Q K V dO
+                            # ------------------------------------------------
+
+                            q = torch.randn(
+                                B, H, N, D,
+                                device="cuda",
+                                dtype=dtype,
+                            )
+
+                            k = torch.randn(
+                                B, H, N, D,
+                                device="cuda",
+                                dtype=dtype,
+                            )
+
+                            v = torch.randn(
+                                B, H, N, D,
+                                device="cuda",
+                                dtype=dtype,
+                            )
+
+                            do = torch.randn(
+                                B, H, N, D,
+                                device="cuda",
+                                dtype=dtype,
+                            )
+
+
+                            # =================================================
+                            # YOUR FLASHATTN
+                            # =================================================
+
+                            o, L = flash_fwd(
+                                q,
+                                k,
+                                v,
+                                causal,
+                            )
+
+
+                            def custom_backward():
+
+                                return flash_bwd(
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    do,
+                                    L,
+                                    causal,
+                                )
+
+
+                            # =================================================
+                            # PYTORCH SDPA
+                            #
+                            # Force Flash Attention implementation.
+                            # =================================================
+
+                            qs = (
+                                q.detach()
+                                .clone()
+                                .requires_grad_(True)
+                            )
+
+                            ks = (
+                                k.detach()
+                                .clone()
+                                .requires_grad_(True)
+                            )
+
+                            vs = (
+                                v.detach()
+                                .clone()
+                                .requires_grad_(True)
+                            )
+
+
+                            with sdpa_kernel(
+                                SDPBackend.FLASH_ATTENTION
+                            ):
+
+                                sdpa_o = (
+                                    F.scaled_dot_product_attention(
+                                        qs,
+                                        ks,
+                                        vs,
+                                        is_causal=causal,
+                                    )
+                                )
+
+
+                            def sdpa_backward():
+
+                                return torch.autograd.grad(
+                                    sdpa_o,
+                                    (qs, ks, vs),
+                                    do,
+                                    retain_graph=True,
+                                )
+
+
+                            # =================================================
+                            # TIME
+                            # =================================================
+
+                            t_custom = time_ms(
+                                custom_backward,
+                                args.warmup,
+                                args.iters,
+                            )
+
+                            t_sdpa = time_ms(
+                                sdpa_backward,
+                                args.warmup,
+                                args.iters,
+                            )
+
+
+                            # =================================================
+                            # METRICS
+                            # =================================================
+
+                            flops = bwd_flops(
+                                B,
+                                H,
+                                N,
+                                D,
+                                causal,
+                            )
+
+                            custom_tflops = (
+                                flops /
+                                t_custom /
+                                1e9
+                            )
+
+                            sdpa_tflops = (
+                                flops /
+                                t_sdpa /
+                                1e9
+                            )
+
+                            speedup = (
+                                t_sdpa /
+                                t_custom
+                            )
+
+
+                            print(
+                                f"{B:>3} "
+                                f"{H:>3} "
+                                f"{N:>6} "
+                                f"{D:>4} "
+                                f"{str(causal):>6} | "
+                                f"{t_custom:>11.3f} "
+                                f"{custom_tflops:>10.2f} | "
+                                f"{t_sdpa:>10.3f} "
+                                f"{sdpa_tflops:>10.2f} | "
+                                f"{speedup:>7.2f}x"
+                            )
+
+
+                            rows.append([
+                                B,
+                                H,
+                                N,
+                                D,
+                                causal,
+                                t_custom,
+                                custom_tflops,
+                                t_sdpa,
+                                sdpa_tflops,
+                                speedup,
+                            ])
+
+
+                        except RuntimeError as e:
+
+                            if "out of memory" in str(e).lower():
+
+                                print(
+                                    f"{B:>3} "
+                                    f"{H:>3} "
+                                    f"{N:>6} "
+                                    f"{D:>4} "
+                                    f"{str(causal):>6} | "
+                                    f"OOM - skipped"
+                                )
+
+                                torch.cuda.empty_cache()
+
+                            else:
+
+                                print(
+                                    f"{B:>3} "
+                                    f"{H:>3} "
+                                    f"{N:>6} "
+                                    f"{D:>4} "
+                                    f"{str(causal):>6} | "
+                                    f"FAILED: {e}"
+                                )
+
+
+                        finally:
+
+                            for name in [
+                                "q",
+                                "k",
+                                "v",
+                                "do",
+                                "o",
+                                "L",
+                                "qs",
+                                "ks",
+                                "vs",
+                                "sdpa_o",
+                            ]:
+
+                                if name in locals():
+                                    del locals()[name]
+
+                            torch.cuda.empty_cache()
+
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    if args.csv:
+
+        with open(
+            args.csv,
+            "w",
+            newline="",
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow([
+                "B",
+                "H",
+                "N",
+                "D",
+                "causal",
+                "custom_ms",
+                "custom_tflops",
+                "sdpa_ms",
+                "sdpa_tflops",
+                "speedup",
+            ])
+
+            writer.writerows(rows)
+
+        print()
+        print("Saved:", args.csv)
 
 
 if __name__ == "__main__":

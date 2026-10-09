@@ -1,5 +1,4 @@
 #include <torch/extension.h>
-
 #include <vector>
 
 namespace py = pybind11;
