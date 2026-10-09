@@ -1,24 +1,31 @@
 # FlashAttention CUDA Scratch
 
-A from-scratch CUDA implementation of FlashAttention forward and backward: tensor-core MMA (`m16n8k16`), `cp.async` tiled loads, double-buffered shared memory, online softmax in registers, and a manually launched three-kernel backward. Built for learning and profiling, not as a production replacement for PyTorch SDPA or FlashAttention.
+A from-scratch CUDA implementation of FlashAttention forward and backward. It uses inline PTX tensor-core MMA (`m16n8k16`), `cp.async` tile loads, online softmax, and a manually launched three-kernel backward pass.
 
-Measured position vs SDPA (RTX 3050 6GB Laptop, sm_86): forward ~0.5-0.6x, backward ~0.2-0.4x. SDPA operates at the practical tensor-core ceiling of this GPU; the gap is quantified and explained in [Why it is slower than SDPA](#why-it-is-slower-than-sdpa).
+This is a learning and profiling project, **not a production replacement** for PyTorch SDPA or the official FlashAttention implementations.
+
+On the tested NVIDIA RTX 3050 6GB Laptop GPU (`sm_86`), the latest forward benchmark is close to SDPA for many dimensions up to `D=128`, but falls behind more clearly at `D=192` and `D=256`. The recorded backward results are substantially slower than SDPA, especially at longer sequence lengths. The tables below show the measured results and the hardware and implementation constraints that explain the gap.
 
 ## Quick start
 
-Requirements:
+### Requirements
 
-- Linux, NVIDIA GPU with compute capability 8.0 or newer
-- CUDA toolkit with `nvcc` on `PATH`, matching the CUDA version your PyTorch was built with
-- Python 3.9+ and PyTorch 2.1+ with CUDA support (tested: Python 3.10, PyTorch 2.7.1+cu118, CUDA 11.8)
+- Linux and an NVIDIA GPU with compute capability 8.0 or newer.
+- CUDA Toolkit with `nvcc` available on `PATH`, matching the CUDA version used by your PyTorch installation.
+- Python 3.9+ and a CUDA-enabled PyTorch installation.
+- Tested environment: Python 3.10, PyTorch 2.7.1+cu118, CUDA 11.8, RTX 3050 6GB Laptop GPU.
+
+### Install
 
 ```bash
-https://github.com/akshay919191/flashattn-V1
+git clone https://github.com/akshay919191/flashattn-V1.git
 cd flashattn-V1
 pip install -e . --no-build-isolation
 ```
 
-Smoke test:
+`--no-build-isolation` uses the PyTorch already installed in the active environment instead of building against an isolated environment that may use a different CUDA-enabled PyTorch package.
+
+### Smoke test
 
 ```python
 import torch
@@ -30,39 +37,26 @@ v = torch.randn(2, 16, 1024, 64, device="cuda", dtype=torch.float16, requires_gr
 
 out = flash_attn(q, k, v, causal=True)
 out.sum().backward()
+
 print(out.shape, q.grad.shape)
 ```
 
-No install? Run Python from the repository root and `import flash_acc_reg`. If the compiled module is not found, the kernels are compiled on first import (about a minute) and cached in `~/.cache/torch_extensions`.
+When running from the repository root, `import flash_acc_reg` can use the JIT fallback if the compiled extension is not available. The first JIT import compiles the CUDA extension and caches it under `~/.cache/torch_extensions`.
 
-## Supported inputs
+## API
 
-| Property | Support |
-|---|---|
-| Device | CUDA, sm_80+ required (`cp.async`, `m16n8k16`) |
-| Input dtype | FP16 (FP32 accumulation in softmax and MMA) |
-| B, H, Sq, Skv | Runtime dynamic; cross-attention (`Sq != Skv`) supported |
-| Masking | Unmasked; causal (top-left aligned, key <= query) |
-| GQA / MQA | Yes. K/V may carry `H_kv` heads with `H % H_kv == 0` (`H_kv = H`: MHA, `H_kv = 1`: MQA) |
-| Head dim D | Any integer 1..256 (no divisibility requirement); rounded up to `D_PAD` in {32, 64, 80, 96, 128, 160, 192, 224, 256} |
-| Dropout | No |
-| Variable-length packed sequences | No |
-| Sliding window / bottom-right causal | No |
-
-## Python API
-
-### High level (autograd)
+### High-level autograd interface
 
 ```python
 from flash_acc_reg import flash_attn
 
 O = flash_attn(Q, K, V, causal=False)
-O.backward(dO)          # gradients flow through the custom backward kernels
+O.backward(dO)
 ```
 
-`flash_attn` validates its inputs (CUDA tensors, 4D shape) and registers the forward and backward kernels with PyTorch autograd.
+The wrapper validates the basic tensor properties and registers the custom forward and backward kernels with PyTorch autograd.
 
-### Low level (raw kernels)
+### Low-level kernel interface
 
 ```python
 from flash_acc_reg import _C
@@ -71,257 +65,266 @@ O, L = _C.flash_fwd(Q, K, V, causal)
 dQ, dK, dV = _C.flash_bwd(Q, K, V, O, dO, L, causal)
 ```
 
-Note the argument order of `flash_bwd`: `O`, then `dO`, then `L`.
+The argument order for `flash_bwd` is `Q, K, V, O, dO, L, causal`.
 
-### Shapes
+### Tensor shapes
 
-```
+```text
 Q, O, dO, dQ: [B, H,    Sq,  D]
 K, V:         [B, H_kv, Skv, D]
-dK, dV:       [B, H_kv, Skv, D]   (returned with H_kv heads)
+dK, dV:       [B, H_kv, Skv, D]
 L:            [B, H,    Sq]
 ```
 
-`H_kv` must divide `H`; violations are rejected with explicit errors. `L` is the per-row log-sum-exp (`m + log(l)`, FP32) consumed by the backward.
+`H_kv` must divide `H`. `H_kv == H` is standard multi-head attention; `H_kv == 1` is multi-query attention. The backward returns `dK` and `dV` with `H_kv` heads. `L` is the per-query-row log-sum-exp (`m + log(l)`, FP32) consumed by the backward pass.
 
-Pass `causal=True/False` explicitly in tests and benchmarks.
+Pass `causal=True` or `causal=False` explicitly in tests and benchmarks.
+
+## Current input constraints
+
+| Property | Current behavior |
+|---|---|
+| Device | CUDA; kernels target compute capability 8.0+; benchmarked on `sm_86` |
+| Input dtype | FP16 only |
+| Accumulation | FP32 MMA accumulators and FP32 softmax statistics |
+| Attention type | Self-attention and cross-attention; `Sq` may differ from `Skv` when the tile constraints below are met |
+| GQA / MQA | Supported by the head mapping `kv_head = head / (H / H_kv)` |
+| Masking | Unmasked or top-left causal (`key_index <= query_index`) |
+| Dropout | Not supported |
+| BF16 | Not supported |
+| Variable-length packed sequences | Not supported |
+| Sliding-window or bottom-right causal masking | Not supported |
+
+**Important implementation constraints:** the current forward kernel assumes both `Sq` and `Skv` are multiples of 64. It also currently requires `D` to equal one of the dispatched tile dimensions: `{32, 64, 80, 96, 128, 160, 192, 224, 256}`. Although the dispatcher selects a padded dimension for other `D` values, the current forward kernel returns early when `actual_D != D_PAD`; those arbitrary dimensions are therefore not safely supported yet. The same early-return behavior applies when the forward sequence lengths are not multiples of 64. The high-level API does not currently turn all of these cases into explicit validation errors, so do not rely on an output from an unsupported shape.
+
+The benchmark shapes in this README use supported tile sizes and sequence lengths divisible by 64.
 
 ## Project layout
 
-```
-flash-attention-scratch/
+```text
+flashattn-V1/
 ├── pyproject.toml
-├── setup.py                 build script (AOT build, builds flash_acc_reg._C)
+├── setup.py
 ├── README.md
-├── .gitignore
 ├── csrc/
-│   ├── bindings.cpp         pybind11 module
-│   └── flashattn.cu         forward and backward kernels + launchers
-├── flash_acc_reg/           importable Python package
-│   ├── __init__.py          loads _C, or falls back to the JIT build
-│   ├── _jit.py              JIT build via torch.utils.cpp_extension.load
-│   └── ops.py               autograd wrapper + input validation
-├── src/baseline/            baseline kernels used for comparison
-├── tests/                   correctness tests (pytest)
-└── benchmarks/              bench_fwd.py, bench_bwd.py
+│   ├── bindings.cpp       # pybind11 module
+│   ├── flashattn.cu       # entry points and dispatch
+│   ├── mma_helpers.cuh    # MMA, tile-load and layout helpers
+│   ├── fwd_kernel.cuh    # forward kernel
+│   ├── fwd_launch.cuh    # forward launch configuration
+│   ├── bwd_kernel.cuh    # backward kernels
+│   └── bwd_launch.cuh    # backward launch configuration
+├── flash_acc_reg/
+│   ├── __init__.py        # compiled extension or JIT fallback
+│   ├── _jit.py            # torch.utils.cpp_extension.load
+│   └── ops.py             # autograd wrapper and input validation
+├── src/baseline/
+├── tests/
+└── benchmarks/
+    ├── bench_fwd.py
+    └── bench_bwd.py
 ```
 
-## Current status
+## Implementation
 
-- forward: working (tested sweep below)
-- backward: working (tested sweep below)
-- causal: working (top-left mask)
-- cross-attention: working for `Sq < Skv` and `Sq > Skv`
-- dtype: FP16 only
+### Forward
 
-Backward uses three kernels:
+The forward kernel uses a `64 x 64` query/key tile configuration and 128 threads per CTA (four warps). It stages the query through the K shared-memory buffer, loads the query fragments into registers, and then reuses the K buffer for key tiles. The K and V tiles are **single-buffered**, not two full alternating K/V buffer sets. `cp.async` loads are overlapped with portions of the MMA and softmax work, with explicit `wait_group` calls and barriers where shared-memory buffers are reused.
 
-1. Delta kernel: `Delta = rowsum(O * dO)`
-2. dK/dV kernel: one block per (batch, head, KV tile)
-3. dQ kernel: one block per (batch, head, Q tile)
+The main steps are:
 
-The split gives every output tile a single owning block: no atomics, plain stores, and causally-dead KV tiles store zeros themselves. dK/dV/dQ require no pre-zeroing.
+1. Load Q, K, and V tiles.
+2. Compute attention scores with tensor-core MMA (`m16n8k16`) and FP32 accumulators.
+3. Apply scaling and the optional top-left causal mask.
+4. Update the online softmax maximum and normalization sum.
+5. Compute the probability-weighted V contribution with MMA and accumulate the output.
+6. Store the output and per-row log-sum-exp for backward.
 
-## Correctness
+The shared-memory footprint for the current forward layout is:
 
-The combined test compares O, L, dQ, dK, dV against a float32 PyTorch reference. Latest sweep: 9 shapes x 18 modes (self- and cross-attention, causal and unmasked) across all nine `D_PAD` values.
+`2 * Bc * (D_PAD + 8) * sizeof(fp16)`, with `Bc = 64`.
 
-**Summary: 18/18 modes passed**
+| `D_PAD` | Shared memory per CTA |
+|---:|---:|
+| 32 | 10 KiB |
+| 64 | 18 KiB |
+| 80 | 22 KiB |
+| 96 | 26 KiB |
+| 128 | 34 KiB |
+| 160 | 42 KiB |
+| 192 | 50 KiB |
+| 224 | 58 KiB |
+| 256 | 66 KiB |
 
-| Tensor | Max abs error |
-|---|---|
-| O | 0.0012186 |
-| L | 0.0000014 |
-| dQ | 0.0014327 |
-| dK | 0.0014586 |
-| dV | 0.0017262 |
+The exact values are rounded here to the nearest KiB; the source formula includes the padded shared-memory stride.
 
-These validate the tested inputs and tolerances; they are not a proof for every shape or distribution.
+### Backward
 
-Run the tests (a GPU is required):
+Backward is split into three kernels:
+
+1. **Delta:** `Delta = rowsum(O * dO)`.
+2. **dK/dV:** one block owns each KV tile and writes its gradient tile.
+3. **dQ:** one block owns each query tile and writes its gradient tile.
+
+This ownership strategy avoids atomics and the need to pre-zero `dQ`, `dK`, and `dV`. Causally dead KV tiles are explicitly written as zeros by their owning block. The trade-off is that the separate dQ and dK/dV kernels reread operands rather than computing all gradients in one fused pass.
+
+The backward math follows the usual attention derivatives:
+
+```text
+S   = Q K^T
+P   = exp(S * scale - L)
+dV  = P^T @ dO
+dP  = dO @ V^T
+dS  = P * (dP - Delta) * scale
+dQ  = dS @ K
+dK  = dS^T @ Q
+```
+
+## Correctness and validation
+
+An earlier recorded test sweep reported 18/18 modes passing across nine shapes and self-attention/cross-attention, causal/unmasked cases. The recorded maximum absolute errors against a float32 PyTorch reference were:
+
+| Tensor | Max absolute error |
+|---|---:|
+| `O` | 0.0012186 |
+| `L` | 0.0000014 |
+| `dQ` | 0.0014327 |
+| `dK` | 0.0014586 |
+| `dV` | 0.0017262 |
+
+These are historical figures from the previously recorded sweep. The latest source changes to the forward tile loader and shared-memory sizing have been exercised by the forward benchmark, but a full correctness sweep after those changes has not been established by the benchmark log alone. Re-run the tests on the exact checkout before treating these error figures as validation of that revision:
 
 ```bash
 pytest tests/ -v
 ```
 
-Re-run the sweep after any kernel change. The any-D loader, padded strides, and exclusive-store rework are covered by the same harness.
-
 ## Benchmark environment
 
-```
+```text
 GPU:        NVIDIA GeForce RTX 3050 6GB Laptop GPU (GA107, sm_86)
 CUDA:       11.8
 PyTorch:    2.7.1+cu118
-dtype:      FP16
-SDPA:       backend auto
-Harness:    H = 16; token count held constant at B*N = 16384
-            (B = 128/64/32/16/8/4 for N = 128/256/512/1024/2048/4096)
-            causal TFLOPs counted with effective (masked) FLOPs
+Input dtype: FP16
+SDPA:       PyTorch backend auto
+Heads:      H = 16
+Workload:   B * N = 16384; B = 128/64/32/16/8/4 for N = 128/256/512/1024/2048/4096
 ```
+
+Run the benchmarks with:
 
 ```bash
 python -m benchmarks.bench_fwd
 python -m benchmarks.bench_bwd
 ```
 
-Metric: `speedup = t_SDPA / t_extension` (> 1 means the extension is faster). SDPA's forward+backward comparison includes its autograd graph; the extension's includes the forward kernel plus the three backward kernels.
+The metric in the tables is `speedup = t_SDPA / t_extension`; values above 1 mean the extension was faster in that cell. Causal TFLOPs use effective masked FLOPs. For small sequence lengths, timings are strongly affected by launch and wrapper overhead; isolated speedups above 1 should not be treated as evidence of a sustained compute-throughput advantage.
+
+**Data provenance:** the forward tables and forward TFLOPs below use the latest supplied `bench_fwd` run. The backward tables and backward TFLOPs are retained from the earlier recorded sweep and were not refreshed by that forward-only run.
 
 ## Results
 
-### Forward speedup (SDPA / extension), unmasked
+### Forward speedup — unmasked (SDPA / extension)
 
-| D \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 |
-|---|---|---|---|---|---|---|
-| 32 | 0.64 | 0.45 | 0.51 | 0.54 | 0.57 | 0.59 |
-| 64 | 0.81 | 0.52 | 0.49 | 0.53 | 0.55 | 0.57 |
-| 96 | 0.64 | 0.43 | 0.48 | 0.51 | 0.52 | 0.53 |
-| 128 | 0.65 | 0.46 | 0.50 | 0.54 | 0.56 | 0.57 |
-| 192 | 0.64 | 0.51 | 0.53 | 0.54 | 0.55 | 0.55 |
-| 256 | 0.65 | 0.55 | 0.56 | 0.56 | 0.56 | 0.57 |
+| `D \ N` | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32  | 1.02 | 1.05 | 1.06 | 1.01 | 1.00 | 0.99 |
+| 64  | 1.27 | 1.10 | 0.96 | 0.96 | 0.95 | 0.95 |
+| 96  | 1.04 | 0.83 | 0.87 | 0.87 | 0.89 | 0.89 |
+| 128 | 1.00 | 0.85 | 0.90 | 0.93 | 0.94 | 0.94 |
+| 192 | 0.89 | 0.70 | 0.73 | 0.74 | 0.74 | 0.74 |
+| 256 | 0.50 | 0.46 | 0.50 | 0.52 | 0.53 | 0.55 |
 
-### Forward speedup, causal
+### Forward speedup — causal (SDPA / extension)
 
-| D \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 |
-|---|---|---|---|---|---|---|
-| 32 | 0.76 | 0.57 | 0.55 | 0.56 | 0.58 | 0.60 |
-| 64 | 0.89 | 0.75 | 0.61 | 0.56 | 0.57 | 0.59 |
-| 96 | 0.90 | 0.70 | 0.48 | 0.52 | 0.54 | 0.57 |
-| 128 | 0.95 | 0.87 | 0.66 | 0.54 | 0.58 | 0.61 |
-| 192 | 0.75 | 0.68 | 0.61 | 0.57 | 0.57 | 0.57 |
-| 256 | 0.93 | 0.84 | 0.70 | 0.65 | 0.64 | 0.64 |
+| `D \ N` | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32  | 1.01 | 1.04 | 1.15 | 1.07 | 1.02 | 0.99 |
+| 64  | 1.19 | 1.38 | 1.22 | 1.03 | 0.99 | 0.98 |
+| 96  | 1.23 | 1.29 | 0.90 | 0.94 | 0.95 | 0.98 |
+| 128 | 1.23 | 1.56 | 1.21 | 0.94 | 0.98 | 1.00 |
+| 192 | 0.95 | 0.95 | 0.85 | 0.79 | 0.79 | 0.77 |
+| 256 | 0.72 | 0.72 | 0.60 | 0.54 | 0.51 | 0.48 |
 
-### Backward speedup (SDPA / extension), unmasked
+### Backward speedup — unmasked (SDPA / extension)
 
-| D \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 |
-|---|---|---|---|---|---|---|
-| 32 | 0.82 | 0.52 | 0.37 | 0.31 | 0.28 | 0.26 |
-| 64 | 0.67 | 0.44 | 0.34 | 0.29 | 0.27 | 0.25 |
-| 96 | 0.78 | 0.50 | 0.40 | 0.34 | 0.32 | 0.30 |
+| `D \ N` | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32  | 0.82 | 0.52 | 0.37 | 0.31 | 0.28 | 0.26 |
+| 64  | 0.67 | 0.44 | 0.34 | 0.29 | 0.27 | 0.25 |
+| 96  | 0.78 | 0.50 | 0.40 | 0.34 | 0.32 | 0.30 |
 | 128 | 0.58 | 0.37 | 0.30 | 0.25 | 0.23 | 0.22 |
 | 192 | 0.68 | 0.45 | 0.35 | 0.29 | 0.26 | 0.25 |
 | 256 | 0.49 | 0.32 | 0.25 | 0.26 | 0.32 | 0.17 |
 
-### Backward speedup, causal (run interrupted; partial)
+The recorded causal backward sweep is incomplete, so no full causal-backward speedup table is presented.
 
-| D \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 |
-|---|---|---|---|---|---|---|
-| 32 | 1.09 | 0.70 | 0.50 | 0.38 | 0.32 | 0.29 |
-| 64 | 0.91 | - | - | - | - | - |
+### Forward TFLOPs at `N = 4096` — unmasked
 
-### TFLOPs at N=4096 (compute-bound end of the sweep, unmasked)
+| `D` | Extension forward | SDPA forward |
+|---:|---:|---:|
+| 32  | 16.8 | 16.9 |
+| 64  | 16.9 | 17.8 |
+| 96  | 16.3 | 18.3 |
+| 128 | 16.8 | 17.9 |
+| 192 | 13.2 | 18.0 |
+| 256 | 9.0 | 16.5 |
 
-| D | ext fwd | SDPA fwd | ext bwd | SDPA bwd |
-|---|---|---|---|---|
-| 32 | 10.0 | 17.0 | 4.1 | 15.5 |
-| 64 | 10.1 | 17.8 | 4.2 | 16.5 |
-| 96 | 9.7 | 18.3 | 4.9 | 16.2 |
-| 128 | 10.2 | 17.8 | 3.6 | 15.9 |
-| 192 | 9.9 | 18.0 | 3.2 | 12.7 |
-| 256 | 9.4 | 16.6 | 2.4 | 13.8 |
+### Backward TFLOPs at `N = 4096` — unmasked, historical sweep
 
-### Reading of the data
-
-- Forward plateaus at ~10 TFLOPs regardless of D; SDPA plateaus at 16.5-18.4.
-- Backward plateaus at 2.4-4.9 TFLOPs; SDPA at 13-16.5 for D <= 128.
-- At N <= 512 both sides are launch/overhead-floored; those cells measure overhead floors, not kernels.
-- The single > 1x cell (backward causal, D=32, N=128) is that floor, not a kernel advantage.
-- SDPA's backward drops at D = 192/256 (different backend route for large head dims) but still leads by 2-6x.
+| `D` | Extension backward | SDPA backward |
+|---:|---:|---:|
+| 32  | 4.1 | 15.5 |
+| 64  | 4.2 | 16.5 |
+| 96  | 4.9 | 16.2 |
+| 128 | 3.6 | 15.9 |
+| 192 | 3.2 | 12.7 |
+| 256 | 2.4 | 13.8 |
 
 ## Why it is slower than SDPA
 
-### Hardware frame
+The results reflect both the limits of the target GPU and the current kernel design. The hardware is not the only explanation: the performance gap at large head dimensions shows that this implementation does not keep the available hardware equally busy.
 
-On GA10x, dense FP16 tensor ops with FP32 accumulate run at 2x the FP32 rate; at this part's boost clocks that is about 18 TFLOPs.
+### Hardware and shared-memory limits
 
-SDPA's best cells sit essentially at that ceiling, so the reference here is hardware-bound and the entire gap is implementation headroom.
+The benchmark runs on a GA107 laptop GPU with compute capability 8.6. NVIDIA documents a maximum of 100 KiB shared memory per SM and 99 KiB per thread block for compute capability 8.6; the A100's compute-capability-8.0 configuration permits a larger shared-memory budget. See the [NVIDIA Ampere tuning guide](https://docs.nvidia.com/cuda/archive/12.5.1/ampere-tuning-guide/index.html#occupancy).
 
-Consumer Ampere also caps dynamic shared memory at about 100 KB per SM (vs 164 KB on A100). That cap is the binding constraint throughout.
+The current forward CTA uses a 64-row tile, 128 threads, one K tile and one V tile in shared memory. At `D_PAD=192`, those tiles use about 50 KiB; at `D_PAD=256`, about 66 KiB. That makes it difficult to keep multiple CTAs resident on an SM, especially at the larger dimensions. Fewer resident warps means fewer independent warps available to cover shared-memory, instruction and tensor-core latency. Register use and other block resources also affect the actual occupancy, so the shared-memory calculation is a constraint, not a complete occupancy prediction.
 
-### Forward: ~0.5-0.6x, plateau ~10 TFLOPs
+The RTX 3050's 6 GB of VRAM is mainly a capacity limit: it constrains how large a batch or workload can fit. It is not, by itself, the explanation for low measured TFLOPs in these benchmark cases. The relevant performance limits are compute throughput, memory traffic, occupancy, and synchronization.
 
-**Shared-memory capacity limits occupancy.**
+### Forward: near parity through `D=128`, larger gap at `D=192/256`
 
-One CTA is 128 threads (4 warps) holding Q + 2xK + 2xV tiles: about 25 KB/CTA at `D_PAD`=32, about 45 KB at 64, and 56-87 KB at 80-256. Against the ~100 KB/SM cap that yields 12 / 8 / 4 resident warps per SM.
+At `N=4096`, the extension reaches 16.3–16.9 TFLOPs for `D=32–128`, close to SDPA's 16.9–18.3 TFLOPs in the same run. The gap is more pronounced at `D=192` (13.2 vs 18.0 TFLOPs) and `D=256` (9.0 vs 16.5 TFLOPs). This pattern is consistent with larger MMA fragments, higher shared-memory use and register pressure reducing how efficiently the custom kernel uses the GPU.
 
-Four warps cannot overlap `ldmatrix`, `mma`, and `cp.async` latencies; the tensor pipe stalls on shared-memory dependencies. This is the dominant forward gap and the reason the ratio is flat at ~0.5-0.6x for every D >= 80.
+The kernel has one K and one V shared-memory tile rather than multiple complete buffer sets. It overlaps some `cp.async` loads with compute, but waits and barriers are still needed before a shared-memory tile can be consumed or reused. The current pipeline does not hide all of that latency. For short sequences, launch and framework overhead is a large fraction of total time; this is why small-N speedup ratios fluctuate and should not be extrapolated to long sequences.
 
-The two-stage K/V pipeline with `wait_group 0` drains the pipeline each iteration; deeper staging needs shared memory the budget does not have at large D.
+### Backward: data movement and synchronization dominate
 
-Overhead floor at N <= 512 (launches, binding, Python) caps both implementations.
+In backward, the implementation performs several matrix operations for every Q/K tile pair. Intermediate probability and gradient-score values move through shared memory to bridge accumulator and MMA operand layouts, with barriers around those conversions. This adds work beyond the tensor-core operations themselves.
 
-### Backward: ~0.2-0.4x, plateau ~2.4-4.9 TFLOPs
+The three-kernel split gives each output tile a single owner and avoids atomics, but it also causes the dQ kernel and dK/dV kernel to reread operands. That increases memory traffic compared with a well-fused implementation. The historical benchmark reflects this: at `N=4096`, the extension records 2.4–4.9 TFLOPs while SDPA records 12.7–16.5 TFLOPs. The gap is therefore not explained solely by a lower theoretical compute ceiling; the current backward algorithm makes less effective use of the available compute and memory system.
 
-The causes are structural, not a matter of tuning.
+### What the numbers do and do not show
 
-**P and dS cross shared memory between every pair of GEMMs.** The MMA accumulator layout (C fragment) is not a valid A-operand layout, so each step does:
+- Forward is close to SDPA for many `D <= 128` long-sequence cases, but is slower for most `D=192` and `D=256` cases.
+- At `N=4096`, the unmasked forward speedups are `0.99x`, `0.95x`, `0.89x`, `0.94x`, `0.74x`, and `0.55x` for `D=32,64,96,128,192,256` respectively.
+- At `N=4096`, causal forward speedups are `0.99x`, `0.98x`, `0.98x`, `1.00x`, `0.77x`, and `0.48x` for those same dimensions.
+- Some short-sequence cells show the extension faster than SDPA, but they are more sensitive to launch and measurement overhead and do not establish a general advantage.
+- The backward results are from an earlier sweep and should be rerun before being compared with a new SDPA or driver/PyTorch environment.
+- Results apply to the GPU, shapes, precision, masking, software versions and backend listed above. They are not a claim about all NVIDIA GPUs or all attention workloads.
 
-```
-registers -> smem -> softmax/dS math -> smem -> ldmatrix -> mma
-```
-
-That is four extra full-tile shared-memory round trips and three `__syncthreads()` per (Q, K) tile pair in each kernel. FA2-class kernels keep P/dS register-resident with per-warp row ownership and shuffle-based layout conversion. This is the largest single backward cost.
-
-**The ~100 KB cap forces tiny tiles.** Br=16-32, Bc=16-32 at `D_PAD` >= 128 with 2xQ + 2xdO staged for the pipeline. Per-step fixed costs (syncs, L/Delta staging, the four smem passes) amortize against Br x Bc x D mma FLOPs; at Br=16 that ratio is poor. (After the stride/bank rework, Br=Bc=64 at D=128 needs about 130 KB. That fits an A100, not GA10x.)
-
-**The two-kernel split re-streams operands.** The dQ kernel reads all of K, V per Q tile; the dK/dV kernel reads all of Q, dO per KV tile. That is roughly 2x the HBM traffic of a fused backward. It is a deliberate trade to avoid atomics; SDPA's fused kernel reads each operand about once.
-
-**Low occupancy.** About 8 warps/SM (2 CTAs x 4 warps): the forward's latency-hiding problem, compounded by more barriers per step.
-
-### Not the cause
-
-- FP16 P/dS storage (SDPA does the same)
-- MMA shape (same `m16n8k16`)
-- Accumulation precision (FP32 in both)
-- Python binding at large N (noise)
-- The loader (`cp.async` with hardware zero-fill; the scalar path only serves ragged `D % 8 != 0` tails)
-
-### Already fixed and reflected in these numbers
-
-- p/dS shared-memory bank conflicts (padded strides; the old layout serialized whole warps on single banks)
-- FP16 atomics on dK/dV/dQ (replaced by exclusive-ownership stores)
-- dK/dV zero-init memsets
-- predicated `cp.async` fills
-- unrolling
-- `launch_bounds`
-
-## Roadmap (ranked by expected payoff on this GPU)
-
-1. Register-resident P/dS backward: per-warp row ownership, shuffle conversions, no smem round trips. Targets the 3-6x backward gap directly.
-2. Occupancy-first tiling for the ~100 KB budget: shapes that keep >= 2 CTAs/SM at every D (smaller staging, split-D across warps) rather than 1 CTA x 4 warps.
-3. Fused backward (dQ folded into the dK/dV kernel via FP32 workspace + reduction) to halve operand re-streaming.
-4. Deeper `cp.async` pipeline where it fits (`D_PAD` <= 64 forward: 3-4 stages, `wait_group 1`).
-5. Small-N floor: CUDA Graph capture of the 3-4 launches; `exp2f` with folded scale; `__half2` elementwise passes.
-
-Any speed claim should be based on repeated measurements with the same shape, mask, device, PyTorch build, and SDPA backend.
-
-## Build
-
-### Option 1: install (recommended)
-
-```bash
-pip install -e . --no-build-isolation
-```
-
-`--no-build-isolation` makes the build use the PyTorch and CUDA already in your environment instead of downloading a second copy of PyTorch that may not match your CUDA version.
-
-The extension compiles into the package as `flash_acc_reg._C`.
-
-### Option 2: JIT (no install)
-
-Run Python from the repository root and `import flash_acc_reg`. The first import compiles the kernels with `torch.utils.cpp_extension.load` and caches them in `~/.cache/torch_extensions`; later imports load instantly. This path needs `nvcc` at import time.
-
-### Build options (environment variables)
+## Build options
 
 | Variable | Default | Effect |
 |---|---|---|
-| `TORCH_CUDA_ARCH_LIST` | detected from the visible GPU, else `8.6` | Target architecture(s), e.g. `"8.0;8.6;8.9"` for a multi-arch build |
-| `FLASH_DEBUG` | `0` | `1` builds with `-O0 -G` for `compute-sanitizer` and `cuda-gdb` |
-| `FLASH_FAST_MATH` | `1` | `0` drops `--use_fast_math`; useful to see how much error fast math contributes |
-| `MAX_JOBS` | all cores | Limit parallel compile jobs if the build runs out of RAM |
+| `TORCH_CUDA_ARCH_LIST` | Detected from the visible GPU, otherwise project default | Target architecture(s), for example `"8.0;8.6;8.9"` |
+| `FLASH_DEBUG` | `0` | `1` enables a debug build with `-O0 -G` for tools such as `compute-sanitizer` and `cuda-gdb` |
+| `FLASH_FAST_MATH` | `1` | `0` disables `--use_fast_math` |
+| `MAX_JOBS` | Build-system default | Limits parallel compilation jobs |
 
-Kernels require sm_80+. On older architectures the kernels exit without raising an error and the outputs are left untouched, so check your GPU before trusting results.
+Kernels are intended for `sm_80+`. The active forward implementation has the shape restrictions documented above; do not assume unsupported inputs are rejected safely.
 
-### Clean rebuild
+## Clean rebuild
 
 ```bash
 pip uninstall -y flash-acc-reg
@@ -331,79 +334,24 @@ rm -rf ~/.cache/torch_extensions/*/flash_acc_reg_jit
 pip install -e . --no-build-isolation
 ```
 
-### Troubleshooting
+## Troubleshooting
 
-| Symptom | Likely cause |
+| Symptom | Likely cause or action |
 |---|---|
-| `nvcc not found` | CUDA toolkit missing or not on `PATH` |
-| Version mismatch error from PyTorch | `nvcc` major version differs from the CUDA version PyTorch was built with (`python -c "import torch; print(torch.version.cuda)"`) |
-| `dynamic module does not define module export function` | `bindings.cpp` does not use `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)`, or an old `.so` with a different name is being imported |
-| Old behavior after editing a `.cu` file | A stale `.so` or JIT cache; do the clean rebuild above |
-| `ImportError` for `flash_acc_reg_ext` | Old tests or benchmarks still import the previous module name; use `from flash_acc_reg import flash_attn` or `from flash_acc_reg import _C` |
-
-## Implementation notes
-
-### Forward
-
-- tiled Q/K/V loads via `cp.async` (hardware zero-fill of out-of-range tiles)
-- double-buffered K/V shared memory, 2-stage pipeline
-- tensor-core `m16n8k16` score computation (FP32 accumulators)
-- online softmax in registers (per-warp max/sum, quad reduction)
-- tensor-core P @ V
-- logsumexp written for backward
-
-### Backward
-
-```
-S   = Q K^T
-P   = exp(S * scale - L)
-dV  = P^T @ dO
-dP  = dO V^T
-dS  = P * (dP - Delta) * scale
-dQ  = dS @ K               (Q-tile-owned kernel)
-dK  = dS^T @ Q             (KV-tile-owned kernel)
-```
-
-### Layout details that matter
-
-- shared-memory strides padded (+8) to avoid bank conflicts, including the p/dS tile
-  - stored `[k][q]` in dK/dV
-  - stored `[q][k]` in dQ
-- exclusive tile ownership gives plain stores, no atomics, no pre-zeroing
-- GQA mapping: `kv_head = head / (H / H_kv)`
-- host-side constexpr smem calculators mirror the kernel layouts and opt in via `cudaFuncSetAttribute` (> 48 KB dynamic smem requires it)
-
-## Current limitations
-
-- FP16 only
-- CUDA only (sm_80+)
-- top-left causal mask only
-- no dropout
-- no BF16
-- no varlen
-- no sliding window
-- no bottom-right rectangular causal alignment
-- forward occupancy limited to 1 CTA/SM (4 warps) for `D_PAD` >= 80 on ~100 KB parts
-- performance behind PyTorch SDPA (forward ~0.5-0.6x, backward ~0.2-0.4x here)
-- the causal backward benchmark sweep is incomplete
-
-## Upcoming work
-
-### Dropout
-
-Forward probability dropout, matching backward mask regeneration, seed and offset handling, deterministic testing, causal and unmasked coverage.
-
-**Not started.**
-
-### Kernel architecture and speed
-
-See the ranked roadmap above. The tracking metric is backward TFLOPs at D=128, N=4096 (currently 3.6 vs SDPA 15.9 on the test GPU), plus forward warps/SM at D=128 (currently 4).
+| `nvcc not found` | Install the CUDA Toolkit and put its `bin` directory on `PATH`. |
+| PyTorch/CUDA version mismatch | Compare `nvcc --version` with `python -c "import torch; print(torch.version.cuda)"`. |
+| `dynamic module does not define module export function` | Check that the module name in `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)` matches the built extension and remove stale `.so` files. |
+| Old behavior after editing CUDA sources | Clean the build and JIT cache, then rebuild. |
+| Import failure after a build error | Fix the earlier compiler error first; the import error is often a consequence of the missing extension. |
+| Unsupported `D`, `Sq`, or `Skv` | Use one of the supported forward tile dimensions and sequence lengths divisible by 64; current early returns may otherwise leave output unwritten. |
 
 ## Profiling
 
+With Nsight Compute installed, a basic profiling command is:
+
 ```bash
 sudo env PYTHONPATH=. PATH="$PATH" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
-/usr/local/cuda-11.8/bin/ncu \
+  /usr/local/cuda-11.8/bin/ncu \
   --section SpeedOfLight \
   --section Occupancy \
   --section SchedulerStats \
@@ -415,20 +363,13 @@ sudo env PYTHONPATH=. PATH="$PATH" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
   python -m benchmarks.bench_bwd
 ```
 
-Counters that decide the roadmap order:
+Counters worth inspecting include tensor-pipeline activity, achieved occupancy, shared-memory bank conflicts, and warp-stall reasons such as `long_scoreboard`, `barrier` and `short_scoreboard`. The build keeps `-lineinfo` so Nsight Compute can associate instructions with source lines.
 
-- `sm__pipe_tensor_cycles_active` (tensor utilization)
-- `launch__occupancy_*` (warps/SM from the shared-memory cap)
-- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` (should be near zero after the stride rework)
-- warp-stall reasons (`long_scoreboard`, `barrier`, `short_scoreboard`)
+## Repository hygiene
 
-The build keeps `-lineinfo`, so Nsight Compute can map SASS back to source lines.
+Do not commit generated build artifacts:
 
-## Repo hygiene
-
-Never commit:
-
-```
+```text
 build/
 dist/
 *.egg-info/
@@ -445,3 +386,4 @@ __pycache__/
 
 - Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, 2022.
 - Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, 2023.
+- [NVIDIA Ampere GPU Architecture Tuning Guide](https://docs.nvidia.com/cuda/archive/12.5.1/ampere-tuning-guide/index.html#occupancy).
