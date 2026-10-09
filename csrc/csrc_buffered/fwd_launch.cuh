@@ -11,14 +11,6 @@
 #include <vector>
 
 
-
-template<int D_PAD, int Bc>
-static constexpr size_t smem_fwd() {
-    constexpr int STRIDE = D_PAD + 8;
-    return static_cast<size_t>(2) * Bc * STRIDE * sizeof(__half);
-}
-
-
 template<int D_PAD, int Bc, bool Masked,
          bool FULL_TILES = false>
 static std::vector<torch::Tensor> launch_fwd_impl(
@@ -26,16 +18,18 @@ static std::vector<torch::Tensor> launch_fwd_impl(
     const torch::Tensor& K,
     const torch::Tensor& V
 ) {
-    constexpr int Br = 64;
+    constexpr int Br      = 64;
+    constexpr int PAD     = 8;
+    constexpr int D_STRIDE = D_PAD + PAD;
+    constexpr size_t smem_bytes =
+        (Br * D_STRIDE + 4 * Bc * D_STRIDE) * sizeof(__half) + 256;
 
-    constexpr size_t smem_bytes = smem_fwd<D_PAD, Bc>();
-
-    const int B        = static_cast<int>(Q.size(0));
-    const int H        = static_cast<int>(Q.size(1));
-    const int Sq       = static_cast<int>(Q.size(2));
-    const int Skv      = static_cast<int>(K.size(2));
+    const int B       = static_cast<int>(Q.size(0));
+    const int H       = static_cast<int>(Q.size(1));
+    const int Sq      = static_cast<int>(Q.size(2));
+    const int Skv     = static_cast<int>(K.size(2));
     const int actual_D = static_cast<int>(Q.size(3));
-    const int kvhead   = static_cast<int>(K.size(1));
+    const int kvhead  = static_cast<int>(K.size(1));
 
     auto O = torch::empty_like(Q);
     auto L = torch::empty(
@@ -44,7 +38,7 @@ static std::vector<torch::Tensor> launch_fwd_impl(
 
     dim3 block(128);
     dim3 grid((Sq + Br - 1) / Br, H, B);
-
+    
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(Q.get_device());
 
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -79,17 +73,17 @@ static std::vector<torch::Tensor> dispatch_fwd(
         case  80: return launch_fwd_impl< 80, 64, Masked>(Q, K, V);
         case  96: return launch_fwd_impl< 96, 64, Masked>(Q, K, V);
         case 128:
-            if (Q.size(2) % 64 == 0 &&
-                K.size(2) % 64 == 0 &&
-                Q.size(3) == 128) {
-                return launch_fwd_impl<128, 64, Masked, true>(Q, K, V);
-            }
-            // Fallback for non-aligned D=128 (no FULL_TILES, generic smem).
-            return launch_fwd_impl<128, 64, Masked, false>(Q, K, V);
-        case 160: return launch_fwd_impl<160, 64, Masked>(Q, K, V);
-        case 192: return launch_fwd_impl<192, 64, Masked>(Q, K, V);
-        case 224: return launch_fwd_impl<224, 64, Masked>(Q, K, V);
-        case 256: return launch_fwd_impl<256, 64, Masked>(Q, K, V);
+        if (Q.size(2) % 64 == 0 &&
+            K.size(2) % 64 == 0 &&
+            Q.size(3) == 128) {
+            return launch_fwd_impl<128, 64, Masked, true>(Q, K, V);
+        }
+
+        return launch_fwd_impl<128, 64, Masked>(Q, K, V);
+        case 160: return launch_fwd_impl<160, 32, Masked>(Q, K, V);
+        case 192: return launch_fwd_impl<192, 32, Masked>(Q, K, V);
+        case 224: return launch_fwd_impl<224, 32, Masked>(Q, K, V);
+        case 256: return launch_fwd_impl<256, 16, Masked>(Q, K, V);
     }
     TORCH_CHECK(false, "unsupported D_PAD");
     return {};

@@ -437,33 +437,42 @@ __device__ __forceinline__ void load_tile_full(
     int tid,
     int tile
 ) {
-    // Each thread copies one 16-byte (8 half) chunk per pass. The previous
-    // mapping required D/8 to divide 128 and rejected valid dimensions such
-    // as 80, 96, 160, 192 and 224.
-    static_assert(D > 0 && D % 8 == 0, "D must be a positive multiple of 8");
-    static_assert(STRIDE >= D, "STRIDE must be >= D");
+    constexpr int CPR = D / 8;
+    static_assert(D % 8 == 0, "D must be divisible by 8");
+    static_assert(128 % CPR == 0, "Unsupported column count");
 
-    constexpr int CHUNKS_PER_ROW = D / 8;
-    constexpr int TOTAL_CHUNKS = Rows * CHUNKS_PER_ROW;
-    constexpr int PASSES = (TOTAL_CHUNKS + 127) / 128;
+    constexpr int RPP = 128 / CPR;
+
+    static_assert(Rows % RPP == 0, "Unsupported row count");
+
+    constexpr int PASSES = Rows / RPP;
+
+    const int r = tid / CPR;
+    const int c = (tid % CPR) * 8;
+
+    const __half* src =
+        g + (static_cast<size_t>(tile) * Rows + r) * D + c;
+
+    const uint32_t dst =
+        smem + static_cast<uint32_t>(
+            (r * STRIDE + c) * sizeof(__half));
 
     #pragma unroll
     for (int j = 0; j < PASSES; ++j) {
-        const int chunk = tid + j * 128;
-        if (chunk < TOTAL_CHUNKS) {
-            const int r = chunk / CHUNKS_PER_ROW;
-            const int c = (chunk % CHUNKS_PER_ROW) * 8;
-            const __half* src =
-                g + (static_cast<size_t>(tile) * Rows + r) * D + c;
-            const uint32_t dst = smem + static_cast<uint32_t>(
-                (r * STRIDE + c) * sizeof(__half));
-            asm volatile(
-                "cp.async.cg.shared.global [%0], [%1], 16;\n"
-                :
-                : "r"(dst), "l"(src)
-                : "memory"
-            );
-        }
+        const uint32_t dst_j =
+            dst + static_cast<uint32_t>(
+                j * RPP * STRIDE * static_cast<int>(sizeof(__half)));
+
+        const __half* src_j =
+            src + static_cast<size_t>(j) * RPP * D;
+
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], 16;\n"
+            :
+            : "r"(dst_j),
+            "l"(src_j)
+            : "memory"
+        );
     }
 }
 #endif // MMA_HELPERS_CUH
