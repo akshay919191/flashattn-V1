@@ -17,7 +17,7 @@ flashattn_fwd(
     static_assert(Br == 64, "This kernel requires Br == 64");
     static_assert(Bc > 0 && Bc % 16 == 0, "Bc must be positive and divisible by 16");
     static_assert(D_PAD > 0 && D_PAD % 16 == 0, "D_PAD must be positive and divisible by 16");
-    static_assert(Br <= Bc, "Q is staged through the K buffer, so Br <= Bc");
+    // Bc no longer needs to be >= Br: Q has its own buffer now.
 
     if (blockDim.x != 128) return;
     if (actual_D != D_PAD || Sq <= 0 || Skv <= 0) return;
@@ -64,20 +64,23 @@ flashattn_fwd(
     }
 
     constexpr int PAD      = 8;
-    constexpr int K_STRIDE = D_PAD + PAD;   // also used for Q staging
+    constexpr int Q_STRIDE = D_PAD + PAD;   // Q has its own buffer
+    constexpr int K_STRIDE = D_PAD + PAD;
     constexpr int V_STRIDE = D_PAD + PAD;
     constexpr int Dk = D_PAD / 16;
     constexpr int Bk = Bc / 8;
     constexpr int Dv = D_PAD / 8;
 
-    // smem layout: [ K tile (Bc x K_STRIDE) | V tile (Bc x V_STRIDE) ]
+    // smem layout: [ Q tile (Br x Q_STRIDE) | K tile (Bc x K_STRIDE) | V tile (Bc x V_STRIDE) ]
     extern __shared__ __align__(16) char smem_raw[];
-    const uint32_t K0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    const uint32_t QS = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    const uint32_t K0 = QS + Br * Q_STRIDE * sizeof(__half);
     const uint32_t V0 = K0 + Bc * K_STRIDE * sizeof(__half);
 
     // per-lane offsets (bytes), computed once
+    // Q offset: same row/col layout as before, but into the Q buffer
     const uint32_t q_lane =
-        static_cast<uint32_t>(((warp * 16 + lane16) * K_STRIDE + ((lane < 16) ? 0 : 8)) * sizeof(__half));
+        static_cast<uint32_t>(((warp * 16 + lane16) * Q_STRIDE + ((lane < 16) ? 0 : 8)) * sizeof(__half));
     const uint32_t k_lane =
         static_cast<uint32_t>(((lane16 & 7) * K_STRIDE + (lane16 >> 3) * 8) * sizeof(__half));
     const uint32_t v_lane =
@@ -91,19 +94,23 @@ flashattn_fwd(
 
     const float scale = 1.0f / sqrtf(static_cast<float>(D_PAD));
 
-    load_tile_full<Br, D_PAD, K_STRIDE>(Qptr, K0, tid, tileid);
+    // Load Q into its own dedicated buffer (never overwritten)
+    load_tile_full<Br, D_PAD, Q_STRIDE>(Qptr, QS, tid, tileid);
     asm volatile("cp.async.commit_group;\n");
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncthreads();
 
+    // Read Q fragments from the Q buffer
     uint32_t q_frag[Dk][4];
     #pragma unroll
     for (int ks = 0; ks < Dk; ++ks) {
         ldmatrix_x4(q_frag[ks],
-                    K0 + q_lane + static_cast<uint32_t>(ks * 16 * sizeof(__half)));
+                    QS + q_lane + static_cast<uint32_t>(ks * 16 * sizeof(__half)));
     }
-    __syncthreads();   // every warp has its Q fragments before K overwrites the buffer
+    // No second __syncthreads() needed here: Q is in its own buffer,
+    // the K load below targets K0 which is a separate region.
 
+    // Prefetch K tile 0 into K buffer
     load_tile_full<Bc, D_PAD, K_STRIDE>(Kptr, K0, tid, 0);
     asm volatile("cp.async.commit_group;\n");
 

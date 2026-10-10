@@ -100,9 +100,20 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
     const bool vec_ok   = (global_stride % VEC) == 0;
 
     if (vec_ok) {
+        // total_chunks and blockdim are both compile-time (template) values,
+        // so the trip count is fixed. Rather than recomputing
+        // lr = i / chunks_x and c8 = (i % chunks_x) * VEC from the runtime
+        // value i on every pass (a div + mod against a non-power-of-two
+        // constant for D_PAD in {80,96,160,192,224}), pay for the div/mod
+        // once and carry it forward with an add + compare per pass instead.
+        constexpr int ROW_STEP  = blockdim / chunks_x;
+        constexpr int COL_CARRY = (blockdim % chunks_x) * VEC;
+
+        int lr = tid / chunks_x;
+        int c8 = (tid % chunks_x) * VEC;
+
+        #pragma unroll
         for (int i = tid; i < total_chunks; i += blockdim) {
-            const int lr = i / chunks_x;
-            const int c8 = (i % chunks_x) * VEC;
             const int gr = row_tile * Rows + lr;
             const int gc = col_start + c8;
 
@@ -126,6 +137,10 @@ __device__ __forceinline__ void asyncLOAD_2D_TILE(
                     : "memory"
                 );
             }
+
+            lr += ROW_STEP;
+            c8 += COL_CARRY;
+            if (c8 >= Cols) { c8 -= Cols; ++lr; }
         }
         if (tail != 0) {
             for (int r = tid; r < Rows; r += blockdim) {
@@ -447,12 +462,22 @@ __device__ __forceinline__ void load_tile_full(
     constexpr int TOTAL_CHUNKS = Rows * CHUNKS_PER_ROW;
     constexpr int PASSES = (TOTAL_CHUNKS + 127) / 128;
 
+    // Same strength-reduction as asyncLOAD_2D_TILE: chunk = tid + j*128 is a
+    // runtime value (tid varies per thread), so r = chunk / CHUNKS_PER_ROW
+    // and c = (chunk % CHUNKS_PER_ROW) * 8 were a real div/mod on every one
+    // of the PASSES iterations even though the loop is unrolled -- unrolling
+    // only removes the loop-control overhead, not the data-dependent
+    // division. Compute (r, c) once and carry it with an add + compare.
+    constexpr int ROW_STEP  = 128 / CHUNKS_PER_ROW;
+    constexpr int COL_CARRY = (128 % CHUNKS_PER_ROW) * 8;
+
+    int r = tid / CHUNKS_PER_ROW;
+    int c = (tid % CHUNKS_PER_ROW) * 8;
+
     #pragma unroll
     for (int j = 0; j < PASSES; ++j) {
         const int chunk = tid + j * 128;
         if (chunk < TOTAL_CHUNKS) {
-            const int r = chunk / CHUNKS_PER_ROW;
-            const int c = (chunk % CHUNKS_PER_ROW) * 8;
             const __half* src =
                 g + (static_cast<size_t>(tile) * Rows + r) * D + c;
             const uint32_t dst = smem + static_cast<uint32_t>(
@@ -463,6 +488,11 @@ __device__ __forceinline__ void load_tile_full(
                 : "r"(dst), "l"(src)
                 : "memory"
             );
+        }
+        if (j + 1 < PASSES) {
+            r += ROW_STEP;
+            c += COL_CARRY;
+            if (c >= D) { c -= D; ++r; }
         }
     }
 }

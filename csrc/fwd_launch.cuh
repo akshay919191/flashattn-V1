@@ -11,11 +11,12 @@
 #include <vector>
 
 
-
+// smem now has three regions: Q(Br) + K(Bc) + V(Bc), all with the same stride.
 template<int D_PAD, int Bc>
 static constexpr size_t smem_fwd() {
     constexpr int STRIDE = D_PAD + 8;
-    return static_cast<size_t>(2) * Bc * STRIDE * sizeof(__half);
+    constexpr int Br = 64;
+    return static_cast<size_t>(Br + Bc + Bc) * STRIDE * sizeof(__half);
 }
 
 
@@ -66,6 +67,15 @@ static std::vector<torch::Tensor> launch_fwd_impl(
 }
 
 
+// Bc selection rationale (Q decoupled, smem = (Br=64 + Bc + Bc) * (D_PAD+8) * 2):
+//   Target: <= 50688B (49.5KB) so 2 blocks fit in 102.4KB L1/shared on Ampere.
+//   Bc must also divide all power-of-2 sequence lengths — so Bc ∈ {16, 32, 64}.
+//   D<=96:  Bc=64 -> <=39936B (39KB)  ✓
+//   D=128:  Bc=32 -> 34816B  (34KB)   ✓  [Bc=48 was 42.5KB but 4096%48≠0 → silent zero output]
+//   D=160:  Bc=32 -> 43008B  (42KB)   ✓
+//   D=192:  Bc=32 -> 51200B  (50KB)   ✓  (exactly at limit)
+//   D=224:  Bc=16 -> 44544B  (43.5KB) ✓  [Bc=32 -> 59392B too large]
+//   D=256:  Bc=16 -> 50688B  (49.5KB) ✓
 template<bool Masked>
 static std::vector<torch::Tensor> dispatch_fwd(
     int d_pad,
@@ -80,16 +90,15 @@ static std::vector<torch::Tensor> dispatch_fwd(
         case  96: return launch_fwd_impl< 96, 64, Masked>(Q, K, V);
         case 128:
             if (Q.size(2) % 64 == 0 &&
-                K.size(2) % 64 == 0 &&
+                K.size(2) % 32 == 0 &&
                 Q.size(3) == 128) {
-                return launch_fwd_impl<128, 64, Masked, true>(Q, K, V);
+                return launch_fwd_impl<128, 32, Masked, true>(Q, K, V);
             }
-            // Fallback for non-aligned D=128 (no FULL_TILES, generic smem).
-            return launch_fwd_impl<128, 64, Masked, false>(Q, K, V);
-        case 160: return launch_fwd_impl<160, 64, Masked>(Q, K, V);
-        case 192: return launch_fwd_impl<192, 64, Masked>(Q, K, V);
-        case 224: return launch_fwd_impl<224, 64, Masked>(Q, K, V);
-        case 256: return launch_fwd_impl<256, 64, Masked>(Q, K, V);
+            return launch_fwd_impl<128, 32, Masked, false>(Q, K, V);
+        case 160: return launch_fwd_impl<160, 32, Masked>(Q, K, V);
+        case 192: return launch_fwd_impl<192, 32, Masked>(Q, K, V);
+        case 224: return launch_fwd_impl<224, 16, Masked>(Q, K, V);
+        case 256: return launch_fwd_impl<256, 16, Masked>(Q, K, V);
     }
     TORCH_CHECK(false, "unsupported D_PAD");
     return {};

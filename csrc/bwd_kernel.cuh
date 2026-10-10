@@ -678,7 +678,10 @@ constexpr size_t flashattn_bwd_dkdv_smem_bytes() {
         Br * S_STRIDE * sizeof(float)  +      // score_smem
         Bc * PDS_STRIDE * sizeof(__half) +    // p_ds_smem [Bc,Br]
         2 * Br * sizeof(float) +              // l_smem, delta_smem
-        256;                                  // alignment slack
+        160;                                  // alignment slack: 10 align_ptr()
+                                               // calls in the kernel, each wastes
+                                               // at most 15B rounding to 16B -> 150B
+                                               // worst case, rounded up to 160B.
 }
 
 template<int Br, int Bc, int D_PAD>
@@ -696,5 +699,8 @@ constexpr size_t flashattn_bwd_dq_smem_bytes() {
         Br * S_STRIDE * sizeof(float)  +      // score_smem
         Br * PDS_STRIDE * sizeof(__half) +    // p_ds_smem [Br,Bc]
         2 * Br * sizeof(float) +              // l_smem, delta_smem
-        256;                                  // alignment slack
+        160;                                  // alignment slack: 10 align_ptr()
+                                               // calls in the kernel, each wastes
+                                               // at most 15B rounding to 16B -> 150B
+                                               // worst case, rounded up to 160B.
 }
