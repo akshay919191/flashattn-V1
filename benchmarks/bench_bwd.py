@@ -12,7 +12,7 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 
-import flash_acc_reg_ext as ext
+from flash_acc_reg import _C as ext
 
 
 # ------------------------------------------------------------
