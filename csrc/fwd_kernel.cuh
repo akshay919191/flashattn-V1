@@ -107,9 +107,6 @@ flashattn_fwd(
         ldmatrix_x4(q_frag[ks],
                     QS + q_lane + static_cast<uint32_t>(ks * 16 * sizeof(__half)));
     }
-    // No second __syncthreads() needed here: Q is in its own buffer,
-    // the K load below targets K0 which is a separate region.
-
     // Prefetch K tile 0 into K buffer
     load_tile_full<Bc, D_PAD, K_STRIDE>(Kptr, K0, tid, 0);
     asm volatile("cp.async.commit_group;\n");
@@ -300,8 +297,6 @@ flashattn_fwd(
 
         l_frag[0] = l_frag[0] * alpha0 + tile_sum0;
         l_frag[1] = l_frag[1] * alpha1 + tile_sum1;
-        // no barrier here: the next iteration's top wait+sync is the one that
-        // guarantees every warp finished P V_j before V_{j+1} is issued.
     }
 
     const int row0 = q_block_start + warp * 16 + lane / 4;
