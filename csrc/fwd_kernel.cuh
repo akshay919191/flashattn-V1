@@ -211,7 +211,6 @@ flashattn_fwd(
             }
         }
 
-        // Reduce once after processing all kb iterations.
         local_max0 = fmaxf(
             local_max0,
             __shfl_xor_sync(0xffffffffu, local_max0, 1, 4)
