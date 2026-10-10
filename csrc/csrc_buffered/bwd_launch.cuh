@@ -62,7 +62,6 @@ static std::vector<torch::Tensor> launch_bwd_impl(
             actual_D, total_rows);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // 2) dK / dV kernel
     constexpr size_t dkdv_smem = flashattn_bwd_dkdv_smem_bytes<Br, Bc, D_PAD>();
 
     C10_CUDA_CHECK(cudaFuncSetAttribute(

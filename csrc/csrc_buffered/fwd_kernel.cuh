@@ -2,7 +2,6 @@
 
 #include "mma_helpers.cuh"
 
-
 template<int Br, int Bc, int D_PAD,
          bool masked, bool FULL_TILES = false>
 __global__ void __launch_bounds__(128)

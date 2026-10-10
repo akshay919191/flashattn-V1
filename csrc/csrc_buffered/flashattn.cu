@@ -1,5 +1,3 @@
-
-
 #include "fwd_launch.cuh"
 #include "bwd_launch.cuh"
 

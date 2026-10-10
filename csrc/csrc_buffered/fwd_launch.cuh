@@ -10,7 +10,6 @@
 #include <limits>
 #include <vector>
 
-
 template<int D_PAD, int Bc, bool Masked,
          bool FULL_TILES = false>
 static std::vector<torch::Tensor> launch_fwd_impl(

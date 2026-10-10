@@ -108,7 +108,7 @@ __device__ __forceinline__ void accumulate_f16(
     }
 }
 
-} // namespace flashattn_masked_bwd_detail
+} // namespace 
 
  
 template<int D_PAD>
