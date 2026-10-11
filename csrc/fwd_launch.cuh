@@ -11,7 +11,6 @@
 #include <vector>
 
 
-// smem now has three regions: Q(Br) + K(Bc) + V(Bc), all with the same stride.
 template<int D_PAD, int Bc>
 static constexpr size_t smem_fwd() {
     constexpr int STRIDE = D_PAD + 8;
