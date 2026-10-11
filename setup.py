@@ -29,7 +29,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="flash_acc_reg._C",
-            sources=["csrc/bindings.cpp", "csrc/flashattn.cu"],
+            sources=["csrc/bindings.cpp", "csrc/flashattn.cu"], # if u want to build versatile attn for any shape , use double buffered folder-- same file names
             extra_compile_args={"cxx": ["-O3", "-std=c++17"], "nvcc": nvcc_flags},
         )
     ],
