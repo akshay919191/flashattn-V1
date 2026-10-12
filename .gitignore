@@ -36,6 +36,7 @@ profiles/
 # Logs
 *.log
 
+
 # Virtual envs
 venv/
 .venv/
