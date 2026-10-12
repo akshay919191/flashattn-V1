@@ -1,9 +1,12 @@
 """Forward benchmark: flash_acc_reg_ext vs torch SDPA.
 
+Default sweep: D in {64, 128, 256} x heads in {8, 16, 32} x N in 1024..32768 x {dense, causal}.
+
 Examples:
-  python bench_fwd.py
-  python bench_fwd.py --dims 64 128 256 --seqlens 1024 2048 4096 --causal both
-  python bench_fwd.py --sdpa-backend flash --dtype bf16 --csv fwd.csv
+  python -m benchmarks.bench_fwd
+  python -m benchmarks.bench_fwd --dims 256 --heads 32 --seqlens 8192 32768 --causal true
+  python -m benchmarks.bench_fwd --tokens 1 --csv fwd.csv        # B=1 for every N
+  python -m benchmarks.bench_fwd --sdpa-backend flash --dtype bf16
 """
 import argparse, csv, math
 import torch
@@ -40,7 +43,17 @@ BACKENDS = {"auto": None, "flash": SDPBackend.FLASH_ATTENTION,
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
 
-def time_ms(fn, warmup, iters):
+def time_ms(fn, warmup, iters, budget_ms=4000.0):
+    """Median ms over `iters` runs. Warmup/iters shrink automatically for slow
+    kernels so one config never takes much longer than ~budget_ms."""
+    fn(); torch.cuda.synchronize()                      # lazy init / first-launch cost
+    s0 = torch.cuda.Event(enable_timing=True); e0 = torch.cuda.Event(enable_timing=True)
+    s0.record(); fn(); e0.record(); torch.cuda.synchronize()
+    probe = max(s0.elapsed_time(e0), 1e-3)
+    if probe * (warmup + iters) > budget_ms:
+        warmup = max(1, min(warmup, int(0.2 * budget_ms / probe)))
+        iters = max(3, min(iters, int(0.8 * budget_ms / probe)))
+
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -53,6 +66,7 @@ def time_ms(fn, warmup, iters):
         s.record(); fn(); e.record()
     torch.cuda.synchronize()
     ts = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+    del cache
     return ts[len(ts) // 2]  # median
 
 
@@ -63,54 +77,63 @@ def fwd_flops(B, H, N, D, causal):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dims", type=int, nargs="+", default=[32, 64, 96, 128, 192, 256])
-    p.add_argument("--seqlens", type=int, nargs="+", default=[128, 256, 512, 1024, 2048, 4096])
+    p.add_argument("--dims", type=int, nargs="+", default=[64, 128, 256])
+    p.add_argument("--seqlens", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 16384, 32768])
+    p.add_argument("--heads", type=int, nargs="+", default=[8, 16, 32])
     p.add_argument("--causal", choices=["false", "true", "both"], default="both")
-    p.add_argument("--heads", type=int, default=16)
-    p.add_argument("--tokens", type=int, default=16384, help="B*N held constant per config")
+    p.add_argument("--tokens", type=int, default=16384, help="B*N held constant per config (B = max(1, tokens // N))")
     p.add_argument("--dtype", choices=DTYPES, default="fp16")
     p.add_argument("--sdpa-backend", choices=BACKENDS, default="auto")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--budget-ms", type=float, default=4000.0, help="per-config time budget; warmup/iters shrink to fit")
     p.add_argument("--csv", type=str, default=None)
     a = p.parse_args()
 
     assert all(d % 8 == 0 and 0 < d <= 256 for d in a.dims), "head dims must be multiples of 8 and <= 256"
-    assert all(0 < n <= 4096 for n in a.seqlens), "seqlen must be <= 4096"
     dtype = DTYPES[a.dtype]
     causals = {"false": [False], "true": [True], "both": [False, True]}[a.causal]
     backend = BACKENDS[a.sdpa_backend]
 
     print(f"GPU: {torch.cuda.get_device_name()} | dtype={a.dtype} | sdpa backend={a.sdpa_backend}")
-    hdr = f"{'D':>4} {'N':>5} {'B':>3} {'causal':>6} | {'ext ms':>8} {'TFLOPs':>7} | {'sdpa ms':>8} {'TFLOPs':>7} | {'speedup':>7}"
+    hdr = (f"{'D':>4} {'H':>3} {'N':>5} {'B':>3} {'causal':>6} | {'ext ms':>9} {'TFLOPs':>7} | "
+           f"{'sdpa ms':>9} {'TFLOPs':>7} | {'speedup':>7}")
     print(hdr); print("-" * len(hdr))
     rows = []
     for causal in causals:
         for D in a.dims:
-            for N in a.seqlens:
-                B = max(1, a.tokens // N); H = a.heads
-                q, k, v = (torch.randn(B, H, N, D, device="cuda", dtype=dtype) for _ in range(3))
-                f_ext = lambda: fwd_raw(q, k, v, causal)
+            for H in a.heads:
+                for N in a.seqlens:
+                    B = max(1, a.tokens // N)
+                    try:
+                        q, k, v = (torch.randn(B, H, N, D, device="cuda", dtype=dtype) for _ in range(3))
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"{D:>4} {H:>3} {N:>5} {B:>3} {str(causal):>6} | OOM allocating inputs")
+                        torch.cuda.empty_cache(); continue
+                    f_ext = lambda: fwd_raw(q, k, v, causal)
 
-                def f_sdpa():
-                    if backend is None:
-                        return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-                    with sdpa_kernel(backend):
-                        return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+                    def f_sdpa():
+                        if backend is None:
+                            return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+                        with sdpa_kernel(backend):
+                            return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
 
-                try:
-                    t_e = time_ms(f_ext, a.warmup, a.iters)
-                except Exception as ex:
-                    print(f"{D:>4} {N:>5} {B:>3} {str(causal):>6} | ext failed: {ex}"); continue
-                try:
-                    t_s = time_ms(f_sdpa, a.warmup, a.iters)
-                except Exception:
-                    t_s = float("nan")
-                fl = fwd_flops(B, H, N, D, causal)
-                tf_e, tf_s = fl / t_e / 1e9, fl / t_s / 1e9
-                print(f"{D:>4} {N:>5} {B:>3} {str(causal):>6} | {t_e:8.3f} {tf_e:7.1f} | {t_s:8.3f} {tf_s:7.1f} | {t_s / t_e:6.2f}x")
-                rows.append([D, N, B, H, causal, t_e, tf_e, t_s, tf_s, t_s / t_e])
-                del q, k, v
+                    try:
+                        t_e = time_ms(f_ext, a.warmup, a.iters, a.budget_ms)
+                    except Exception as ex:
+                        print(f"{D:>4} {H:>3} {N:>5} {B:>3} {str(causal):>6} | ext failed: {ex}")
+                        del q, k, v; torch.cuda.empty_cache(); continue
+                    try:
+                        t_s = time_ms(f_sdpa, a.warmup, a.iters, a.budget_ms)
+                    except Exception:
+                        t_s = float("nan")
+                    fl = fwd_flops(B, H, N, D, causal)
+                    tf_e, tf_s = fl / t_e / 1e9, fl / t_s / 1e9
+                    print(f"{D:>4} {H:>3} {N:>5} {B:>3} {str(causal):>6} | {t_e:9.3f} {tf_e:7.1f} | "
+                          f"{t_s:9.3f} {tf_s:7.1f} | {t_s / t_e:6.2f}x", flush=True)
+                    rows.append([D, N, B, H, causal, t_e, tf_e, t_s, tf_s, t_s / t_e])
+                    del q, k, v
+                    torch.cuda.empty_cache()
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
