@@ -92,48 +92,6 @@ cd flashattn-V1
 pip install -e . --no-build-isolation
 ```
 
-### Smoke test
-
-```python
-import torch
-from flash_acc_reg import flash_attn
-
-q = torch.randn(2, 16, 1024, 64, device="cuda", dtype=torch.float16)
-k = torch.randn_like(q)
-v = torch.randn_like(q)
-
-out = flash_attn(q, k, v, causal=True)
-print(out.shape)   # torch.Size([2, 16, 1024, 64])
-```
-
-## API
-
-### High-level autograd wrapper
-
-```python
-from flash_acc_reg import flash_attn
-O = flash_attn(Q, K, V, causal=False)
-```
-
-### Low-level kernel interface
-
-```python
-from flash_acc_reg import _C
-O, L = _C.flash_fwd(Q, K, V, causal)
-```
-
-`L` is the per-row log-sum-exp in natural log (`m + log(l)`, FP32), needed for gradient computation.
-
-### Tensor shapes
-
-```
-Q, O:  [B, H,    Sq,  D]
-K, V:  [B, H_kv, Skv, D]
-L:     [B, H,    Sq]
-```
-
-All tensors must be contiguous. `H_kv` must divide `H`: `H_kv == H` is standard MHA, `H_kv == 1` is MQA.
-
 ## Supported inputs
 
 | Property | Status |
@@ -206,26 +164,6 @@ flashattn-V1/
 | `TORCH_CUDA_ARCH_LIST` | Detected from GPU | Target arch(s), e.g. `"8.0;8.6"` |
 | `FLASH_DEBUG` | `0` | `1` → `-O0 -G` for `compute-sanitizer` / `cuda-gdb` |
 | `FLASH_FAST_MATH` | `1` | `0` → disable `--use_fast_math` |
-
-## Clean rebuild
-
-```bash
-pip uninstall -y flash-acc-reg
-rm -rf build *.egg-info
-find . -name '*.so' -delete
-rm -rf ~/.cache/torch_extensions/*/flash_acc_reg_jit
-pip install -e . --no-build-isolation
-```
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `nvcc not found` | Add CUDA Toolkit `bin/` to `PATH` |
-| PyTorch/CUDA version mismatch | Compare `nvcc --version` with `torch.version.cuda` |
-| `unsupported D_PAD` / head-dim error | `D` must be in the table under [Supported inputs](#supported-inputs) |
-| NaN in the first rows of `O` | Causal with `Sq > Skv`: those rows have no visible key |
-| Old behavior after editing CUDA | Clean build and JIT cache, then reinstall |
 
 ## References
 
